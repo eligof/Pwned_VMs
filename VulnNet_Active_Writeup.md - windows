@@ -1,11 +1,5 @@
 # VulnNet:Active - Professional Penetration Test Report
 
-<p align="center">
-  <img src="https://tryhackme-images.s3.amazonaws.com/room-icons/f9e4d8c57e0a9a5e1e4a3d5c7b8e6f2a.png" width="200"/>
-</p>
-
----
-
 ## Executive Summary
 
 This report documents a complete penetration test of the VulnNet:Active machine from TryHackMe. The engagement resulted in full domain compromise through a chain of vulnerabilities including unauthenticated Redis access, NTLM credential capture, scheduled task hijacking, and privilege escalation via token impersonation.
